@@ -44,6 +44,7 @@ def _existing_today():
         return set()
 
 def _page(r, risk_pct=1.0, balance=1000.0):
+    t_tr = r["time"] + timedelta(hours=3)   # mum zamanı UTC → TR
     risk_amt = balance * risk_pct / 100
     qty = risk_amt / abs(r["entry"] - r["sl"])
     arrow = "LONG" if r["direction"] == "LONG" else "SHORT"
@@ -51,7 +52,7 @@ def _page(r, risk_pct=1.0, balance=1000.0):
         "parent": {"database_id": DB},
         "icon": {"emoji": "🟢" if r["direction"] == "LONG" else "🔴"},
         "properties": {
-            "Ad":     {"title": [{"text": {"content": f"{r['symbol']} {arrow} {r['time']:%d.%m %H:%M}"}}]},
+            "Ad":     {"title": [{"text": {"content": f"{r['symbol']} {arrow} {t_tr:%d.%m %H:%M}"}}]},
             "Tarih":  {"date": {"start": datetime.now(TR).isoformat(timespec="minutes")}},
             "Parite":   {"rich_text": [{"text": {"content": r["symbol"]}}]},
             "Strateji": {"rich_text": [{"text": {"content": r["strategy"]}}]},
