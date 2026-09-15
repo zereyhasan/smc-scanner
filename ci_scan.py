@@ -12,7 +12,7 @@ def main():
     if not res:
         print("Bu turda barajı geçen sinyal yok — normal.")
         return
-    yazilan = notion.write_signals(res, top=10)
+    yazilan = notion.write_signals(res, top=15)
     print("\n--- İlk 10 sinyal özeti ---")
     for r in res[:10]:
         print(f"  {r['symbol']:14s} {r['direction']:5s} {r['strategy']:28s} "

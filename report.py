@@ -153,7 +153,7 @@ def run():
     if NOTION_ENABLED and sigs:
         try:
             import notion
-            notion_written = notion.write_signals(sigs, top=10)
+            notion_written = notion.write_signals(sigs, top=15)
         except Exception as e:
             print(f"  ⚠ Notion yazımı başarısız: {e!r}")
     elif not NOTION_ENABLED:
@@ -297,7 +297,7 @@ def run():
                       f'<table style="margin-top:14px"><thead><tr>{ch}</tr></thead><tbody>{cb}</tbody></table>')
 
     # ---------- Journal ----------
-    journals = "".join(f'<pre>{scanner.journal(s)}</pre>' for s in sigs[:10])
+    journals = "".join(f'<pre>{scanner.journal(s)}</pre>' for s in sigs[:12])
 
     # ---------- KPI'lar ----------
     longs = [s for s in sigs if s["direction"] == "LONG"]

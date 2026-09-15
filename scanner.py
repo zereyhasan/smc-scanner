@@ -1,6 +1,7 @@
-"""100→50 coin SMC tarayıcı (v8.3): çift veri kaynağı + ÇOKLU TEPE SÜPÜRME + MPL köprüsü.
-DATA_SOURCE: 'bybit' (varsayılan, ev) | 'okx' (bulut). Semboller 'BTCUSDT' gösteriminde kalır.
-v8.3: strategy_mpl köprüsü (Maximum Pain Level — mantık mpl.py'de, izole) + extra_sl."""
+"""100→50 coin SMC tarayıcı (v8.3.1): çift veri kaynağı + stratejiler + MPL köprüsü.
+v8.3.1 FIX: scan() dedup anahtarı (symbol, direction) → (symbol, strategy, direction).
+  Eskiden aynı coin+yön'de Sweep, MPL'yi eziyordu → MPL hiç Notion'a/paper'a ulaşmıyordu.
+  Artık her strateji kendi sinyalini taşır (ayrı işlem = ayrı satır)."""
 import os, sys, json, time
 from pathlib import Path
 import requests
@@ -446,8 +447,7 @@ def strategy_multisweep(ctx):
     return None
 
 def strategy_mpl(ctx):
-    """S6: Maximum Pain Level — mpl.py izole modülünden PENDING sinyal üretir.
-    entry = FVG %50 limit fiyatı; paper/backtest bu sinyali limit emir olarak işler."""
+    """S6: Maximum Pain Level — mpl.py izole modülünden PENDING sinyal üretir."""
     try:
         s = mpl.signal(ctx)
     except Exception:
@@ -496,11 +496,14 @@ def scan(limit=MCAP_TOP, workers=8):
                   end="", flush=True)
     print()
     results.sort(key=lambda x: x["score"], reverse=True)
+    # v8.3.1 FIX: dedup anahtarı stratejiyi içerir — farklı stratejiler ayrı işlemlerdir
     seen, tek = set(), []
     for r in results:
-        if (r["symbol"], r["direction"]) in seen:
+        key = (r["symbol"], r["strategy"],
+               "LONG" if r["direction"] == "LONG" else "SHORT")
+        if key in seen:
             continue
-        seen.add((r["symbol"], r["direction"]))
+        seen.add(key)
         tek.append(r)
     return tek
 
@@ -534,9 +537,9 @@ ZAMAN DİLİMİ : 15M (Giriş) / 1H (Trend)
    Risk         : {risk_amt:.2f} USDT (%{risk_pct})
    Pozisyon     : {qty:.6g} adet
 
-5️⃣ ÇIKIŞ PLANI (kısmi TP)
+5️⃣ ÇIKIŞ PLANI
    TP           : {sig['tp']:.6g}
-   Plan         : %50 kâr @1R → SL girişe (BE) → kalan %50 @TP
+   {'Plan: %50 kâr @1R → SL girişe (BE) → kalan %50 @TP' if not sig.get('no_partial') else f"Plan: TAM {sig.get('rr', 2)}R tek çıkış (kısmi TP yok — MPL)"}
    Risk:Ödül    : 1 : {sig['rr']}
    Beklenen Kâr : +{pl:.2f} USDT
 """
