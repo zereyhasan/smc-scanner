@@ -1,21 +1,24 @@
-"""100→50 coin SMC tarayıcı (v8.1): MCAP evreni + buluta dayanıklı veri katmanı.
-v8.1 yenilikleri:
-- _get_json(): JSON-olmayan yanıt durumunda status+content-type+ilk 200 karakteri
-  açıklayan hatayı fırlatır (JSONDecodeError karanlığında teşhis artık logda)
-- 429/5xx/ağ hatalarında 2 yeniden deneme (artan bekleme)
-- MCAP için ÇİFT KAYNAK: CoinGecko → başarısızsa CoinPaprika → o da olursa cache →
-  en son turnover fallback (grup analizi MCAP_RANK'i kullanmaya devam eder)"""
-import sys, json, time
+"""100→50 coin SMC tarayıcı (v8.2): MCAP evreni + ÇİFT VERİ KAYNAĞI.
+DATA_SOURCE ortam değişkeni: 'bybit' (varsayılan, ev) | 'okx' (GitHub Actions bulutu —
+Bybit CloudFront ABD IP'lerini blokladığı için bulutta OKX kullanılır).
+Sembol gösterimi her kaynakta 'BTCUSDT' kalır → Notion/paper/rapor etkilenmez.
+v8.1 kalıtımları: _get_json (JSON-olmayan yanıtta açıklayıcı hata + retry),
+MCAP çift kaynak (CoinGecko → CoinPaprika → cache → turnover fallback)."""
+import os, sys, json, time
 from pathlib import Path
 import requests
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import smc
 
+SOURCE = os.environ.get("DATA_SOURCE", "bybit").lower()   # 'bybit' | 'okx'
+
 FAPI = "https://api.bybit.com"
+OKX  = "https://www.okx.com"
 CG   = "https://api.coingecko.com/api/v3"
 PAPRIKA = "https://api.coinpaprika.com/v1"
-_IV = {"15m": "15", "1h": "60", "4h": "240"}
+_IV_BYBIT = {"15m": "15", "1h": "60", "4h": "240"}
+_IV_OKX   = {"15m": "15m", "1h": "1H", "4h": "4H"}
 MIN_RR = 1.8
 RR_CAP = 2.5
 MCAP_TOP  = 50
@@ -24,7 +27,9 @@ CAT_BANDS = ((10, "Majör"), (25, "Large"), (50, "Mid"))
 STOCKS = {"AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META",
           "COIN", "SPX", "NDX", "XAU"}
 
-MCAP_RANK = {}   # sembol -> (mcap_rank, kategori)
+MCAP_RANK = {}        # sembol -> (mcap_rank, kategori)
+_OKX_MAP = {}         # "BTCUSDT" -> "BTC-USDT-SWAP"
+_COLS = ["t", "open", "high", "low", "close", "volume"]
 
 STRAT_LABELS = {
     "strategy_pullback": "Trend Pullback (OB)",
@@ -58,12 +63,84 @@ def _get_json(url, params=None, timeout=15, retries=2):
             time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"{url} başarısız ({retries + 1} deneme): {last}")
 
+def _to_df(rows):
+    df = pd.DataFrame([(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
+                       for k in rows], columns=_COLS)
+    df = df.drop_duplicates("t").sort_values("t").reset_index(drop=True)
+    df["t"] = pd.to_datetime(df["t"], unit="ms")
+    return df
+
+# ---------------- OKX katmanı (bulut için) ----------------
+def _okx_symbol_map():
+    """OKX SWAP enstrümanları → 'BTCUSDT' gösterim haritası (bir kez çekilir)."""
+    if _OKX_MAP:
+        return _OKX_MAP
+    tick = _get_json(f"{OKX}/api/v5/market/tickers", params={"instType": "SWAP"})
+    for it in tick.get("data", []):
+        iid = it.get("instId", "")
+        if iid.endswith("-USDT-SWAP"):
+            base = iid[:-len("-USDT-SWAP")] + "USDT"
+            _OKX_MAP[base] = iid
+    return _OKX_MAP
+
+def _okx_klines(symbol, interval, limit):
+    """OKX mum verisi — 300'er sayfalı geriye doğru pagination."""
+    m = _okx_symbol_map()
+    inst = m.get(symbol)
+    if not inst:
+        return pd.DataFrame(columns=_COLS)
+    bar = _IV_OKX[interval]
+    need = min(limit, 3000)
+    rows, after, prev = [], None, None
+    while len(rows) < need:
+        params = {"instId": inst, "bar": bar, "limit": 300}
+        if after:
+            params["after"] = after
+        d = _get_json(f"{OKX}/api/v5/market/candles", params=params)
+        batch = d.get("data", [])
+        if not batch or batch[-1][0] == prev:
+            break
+        rows.extend(batch)
+        prev = after
+        after = batch[-1][0]          # batch yeniden eskiye → son eleman en eski
+        if len(batch) < 300:
+            break
+    if not rows:
+        return pd.DataFrame(columns=_COLS)
+    return _to_df(rows)
+
+def _okx_universe_fallback(limit):
+    """MCAP yoksa: OKX tickers → yaklaşık USD hacim sıralı evren."""
+    tick = _get_json(f"{OKX}/api/v5/market/tickers", params={"instType": "SWAP"})
+    rows = []
+    for it in tick.get("data", []):
+        iid = it.get("instId", "")
+        if not iid.endswith("-USDT-SWAP"):
+            continue
+        base = iid[:-len("-USDT-SWAP")] + "USDT"
+        if base[:-4] in STOCKS:
+            continue
+        try:
+            notional = float(it.get("last") or 0) * float(it.get("volCcy24h") or 0)
+        except Exception:
+            notional = 0.0
+        rows.append((base, notional))
+    rows.sort(key=lambda x: -x[1])
+    return [b for b, _ in rows[:limit]]
+
 # ---------------- Market Cap evreni ----------------
 def _category(rank: int) -> str:
     for cap, name in CAT_BANDS:
         if rank <= cap:
             return name
     return "Mid"
+
+def _exchange_symbol_set() -> set:
+    """Aktif kaynağın borsa sembol kümesi ('BTCUSDT' gösterimi)."""
+    if SOURCE == "okx":
+        return set(_okx_symbol_map().keys())
+    tick = _get_json(f"{FAPI}/v5/market/tickers", params=dict(category="linear"))
+    return {x["symbol"] for x in tick["result"]["list"]}
 
 def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
     """MCAP sıralaması: CoinGecko → CoinPaprika → mcap_cache.json → (boş=turnover fallback)"""
@@ -73,7 +150,6 @@ def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
     cache = Path("mcap_cache.json")
     data, src = None, None
 
-    # 1) CoinGecko
     try:
         data = _get_json(f"{CG}/coins/markets",
                          params=dict(vs_currency="usd", order="market_cap_desc",
@@ -82,7 +158,6 @@ def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
     except Exception as e:
         print(f"  ⚠ CoinGecko başarısız: {e}", flush=True)
 
-    # 2) CoinPaprika (anahtar gerekmez, Cloudflare dostu)
     if data is None:
         try:
             rows = _get_json(f"{PAPRIKA}/tickers")
@@ -92,7 +167,6 @@ def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
         except Exception as e:
             print(f"  ⚠ CoinPaprika da başarısız: {e}", flush=True)
 
-    # 3) Cache
     if data is None and cache.exists():
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
@@ -103,30 +177,28 @@ def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
         print("  ⚠ MCAP alınamadı — turnover fallback kullanılacak", flush=True)
         return MCAP_RANK
 
-    if cache.exists() or src in ("coingecko", "coinpaprika"):
-        try:
-            cache.write_text(json.dumps(data), encoding="utf-8")
-        except Exception:
-            pass
+    try:
+        cache.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
 
     try:
-        tick = _get_json(f"{FAPI}/v5/market/tickers", params=dict(category="linear"))
-        bybit = {x["symbol"] for x in tick["result"]["list"]}
+        exch = _exchange_symbol_set()
     except Exception as e:
-        print(f"  ⚠ Bybit tickers başarısız: {e}", flush=True)
-        bybit = set()
+        print(f"  ⚠ Borsa sembol listesi başarısız ({SOURCE}): {e}", flush=True)
+        exch = set()
 
     rank = {}
     for c in data:
         sym = (c.get("symbol") or "").upper() + "USDT"
         rk = c.get("market_cap_rank") or 999
-        if sym in bybit and sym not in rank and sym[:-4] not in STOCKS:
+        if sym in exch and sym not in rank and sym[:-4] not in STOCKS:
             rank[sym] = (rk, _category(rk))
     MCAP_RANK = rank
-    print(f"  MCAP kaynağı: {src} → {len(rank)} coin Bybit futures ile eşleşti", flush=True)
+    print(f"  MCAP kaynağı: {src} → {len(rank)} coin {SOURCE.upper()} ile eşleşti", flush=True)
     return MCAP_RANK
 
-# ---------------- Veri (Bybit) ----------------
+# ---------------- Veri ----------------
 def universe(limit=MCAP_TOP):
     limit = min(limit, MCAP_TOP)
     ensure_mcap(limit)
@@ -135,7 +207,9 @@ def universe(limit=MCAP_TOP):
     if MCAP_RANK:
         print(f"  ⚠ MCAP eşleşen coin {len(MCAP_RANK)} adet (< {limit}) — bunlar kullanılıyor")
         return sorted(MCAP_RANK, key=lambda s: MCAP_RANK[s][0])
-    print("  ⚠ MCAP alınamadı — turnover fallback (24s hacim sıralı)")
+    print(f"  ⚠ MCAP alınamadı — hacim fallback ({SOURCE})")
+    if SOURCE == "okx":
+        return _okx_universe_fallback(limit)
     t = _get_json(f"{FAPI}/v5/market/tickers", params=dict(category="linear"))
     rows = [x for x in t["result"]["list"] if x["symbol"].endswith("USDT")
             and x["symbol"][:-4] not in STOCKS
@@ -144,21 +218,26 @@ def universe(limit=MCAP_TOP):
     return [x["symbol"] for x in rows[:limit]]
 
 def klines(symbol, interval, limit=250):
+    if SOURCE == "okx":
+        return _okx_klines(symbol, interval, limit)
     limit = min(limit, 1000)
     d = _get_json(f"{FAPI}/v5/market/kline",
                   params=dict(category="linear", symbol=symbol,
-                              interval=_IV.get(interval, interval), limit=limit))
+                              interval=_IV_BYBIT.get(interval, interval), limit=limit))
     rows = [(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
             for k in d["result"]["list"]]
-    df = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(rows, columns=_COLS)
     df["t"] = pd.to_datetime(df["t"], unit="ms")
     return df.sort_values("t").reset_index(drop=True)
 
 def klines_multi(symbol, interval, total=6000):
+    """Derin geçmiş. bybit: sayfalı çekim | okx: aynı pagination (derin backtest evde/bybit'te)."""
+    if SOURCE == "okx":
+        return _okx_klines(symbol, interval, total)
     pages, end = [], None
     while sum(len(p) for p in pages) < total:
         params = dict(category="linear", symbol=symbol,
-                      interval=_IV.get(interval, interval), limit=1000)
+                      interval=_IV_BYBIT.get(interval, interval), limit=1000)
         if end:
             params["end"] = end
         d = _get_json(f"{FAPI}/v5/market/kline", params=params)
@@ -171,13 +250,8 @@ def klines_multi(symbol, interval, total=6000):
             break
     rows = [k for p in pages for k in p]
     if not rows:
-        return pd.DataFrame(columns=["t", "open", "high", "low", "close", "volume"])
-    df = pd.DataFrame([(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
-                       for k in rows],
-                      columns=["t", "open", "high", "low", "close", "volume"])
-    df = df.drop_duplicates("t").sort_values("t").reset_index(drop=True)
-    df["t"] = pd.to_datetime(df["t"], unit="ms")
-    return df
+        return pd.DataFrame(columns=_COLS)
+    return _to_df(rows)
 
 def build_context(symbol, htf, ltf):
     hs, ls = smc.find_swings(htf), smc.find_swings(ltf)
@@ -339,7 +413,7 @@ def analyze(symbol):
                 sigs.append(s)
         return sigs or None
     except Exception as e:
-        print(f"  ⚠ {symbol}: {e!r}", flush=True)   # sessiz yutma — bulutta teşhis için görünür
+        print(f"  ⚠ {symbol}: {e!r}", flush=True)   # bulutta teşhis için sessiz yutma yok
         return None
 
 def scan(limit=MCAP_TOP, workers=8):
