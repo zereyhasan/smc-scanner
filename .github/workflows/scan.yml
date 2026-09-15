@@ -1,0 +1,22 @@
+name: SMC Tarama
+on:
+  schedule:
+    # UTC 03,07,11,15,19,23 = TR saatiyle 06,10,14,18,22,02 (4 saatlik ritim, 6 tur/gün)
+    - cron: "0 3,7,11,15,19,23 * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests pandas numpy
+      - name: config.py üret (secrets'tan)
+        run: |
+          echo "NOTION_TOKEN = '${{ secrets.NOTION_TOKEN }}'" > config.py
+          echo "NOTION_DB_ID = '${{ secrets.NOTION_DB_ID }}'" >> config.py
+      - run: python ci_scan.py
