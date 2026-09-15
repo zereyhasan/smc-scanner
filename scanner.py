@@ -1,20 +1,25 @@
-"""100 coin SMC tarayıcı — Bybit + stratejiler + journal (v4: budama + kısmi TP planı)"""
-import sys, requests
+"""100→50 coin SMC tarayıcı (v8): Piyasa değeri (market cap) evreni + kategori haritası.
+Evren: CoinGecko MCAP ilk 50 → Bybit futures kesişimi. CoinGecko erişilemezse
+turnover fallback + mcap_cache.json. Grup analizi için: scanner.MCAP_RANK[sym]=(rank,kategori)"""
+import sys, json
+from pathlib import Path
+import requests
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import smc
 
 FAPI = "https://api.bybit.com"
-_IV = {"1h": "60", "15m": "15"}
+CG   = "https://api.coingecko.com/api/v3"
+_IV = {"15m": "15", "1h": "60", "4h": "240"}
 MIN_RR = 1.8
 RR_CAP = 2.5
+MCAP_TOP  = 50                                   # evren büyüklüğü (piyasa değeri sırası)
+CAT_BANDS = ((10, "Majör"), (25, "Large"), (50, "Mid"))
 
 STOCKS = {"AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META",
           "COIN", "SPX", "NDX", "XAU"}
 
-# v4 BUDAMA: canlı sinyal sadece verinin kazandırmadığı iki stratejiden ÇIKARILDI.
-# Pullback (PF 0.39) ve FVG (PF 0.22) 1000-bar backtestte ölü çıktı — izlemede kalıyorlar.
-ACTIVE_STRATS = ["strategy_sweep", "strategy_breaker"]
+MCAP_RANK = {}   # sembol -> (mcap_rank, kategori)   [gruplu analiz bunu kullanır]
 
 STRAT_LABELS = {
     "strategy_pullback": "Trend Pullback (OB)",
@@ -24,8 +29,66 @@ STRAT_LABELS = {
 }
 STRAT_BY_LABEL = {v: k for k, v in STRAT_LABELS.items()}
 
+# ---------------- Market Cap evreni ----------------
+def _category(rank: int) -> str:
+    for cap, name in CAT_BANDS:
+        if rank <= cap:
+            return name
+    return "Mid"
+
+def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
+    """CoinGecko MCAP sıralamasını çeker, Bybit futures sembolleriyle eşleştirir.
+    Sonuç MCAP_RANK'e yazılır; ağ hatasında mcap_cache.json'a düşer."""
+    global MCAP_RANK
+    if MCAP_RANK and not force:
+        return MCAP_RANK
+    cache = Path("mcap_cache.json")
+    data = None
+    try:
+        r = requests.get(f"{CG}/coins/markets",
+                         params=dict(vs_currency="usd", order="market_cap_desc",
+                                     per_page=min(limit, 250), page=1),
+                         timeout=15)
+        if r.status_code == 200 and isinstance(r.json(), list):
+            data = r.json()
+            cache.write_text(json.dumps(data), encoding="utf-8")
+        else:
+            print(f"  ⚠ CoinGecko HTTP {r.status_code} — cache/fallback deneniyor", flush=True)
+    except Exception as e:
+        print(f"  ⚠ CoinGecko erişilemedi ({e!r}) — cache/fallback", flush=True)
+    if data is None and cache.exists():
+        try:
+            data = json.loads(cache.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+    if not data:
+        return MCAP_RANK                      # boş → çağıran turnover fallback'e düşer
+    try:
+        bybit = {x["symbol"] for x in requests.get(
+            f"{FAPI}/v5/market/tickers", params=dict(category="linear"),
+            timeout=15).json()["result"]["list"]}
+    except Exception:
+        bybit = set()
+    rank = {}
+    for c in data:
+        sym = (c.get("symbol") or "").upper() + "USDT"
+        rk = c.get("market_cap_rank") or 999
+        if sym in bybit and sym not in rank and sym[:-4] not in STOCKS:
+            rank[sym] = (rk, _category(rk))
+    MCAP_RANK = rank
+    return MCAP_RANK
+
 # ---------------- Veri (Bybit) ----------------
-def universe(limit=100):
+def universe(limit=MCAP_TOP):
+    """Piyasa değeri sırasına göre evren. CoinGecko yoksa turnover fallback."""
+    limit = min(limit, MCAP_TOP)
+    ensure_mcap(limit)
+    if len(MCAP_RANK) >= limit:
+        return sorted(MCAP_RANK, key=lambda s: MCAP_RANK[s][0])[:limit]
+    if MCAP_RANK:                              # kısmi liste → yine mcap sırası
+        print(f"  ⚠ MCAP eşleşen coin {len(MCAP_RANK)} adet (< {limit}) — bunlar kullanılıyor")
+        return sorted(MCAP_RANK, key=lambda s: MCAP_RANK[s][0])
+    print("  ⚠ MCAP alınamadı — turnover fallback (24s hacim sıralı)")
     t = requests.get(f"{FAPI}/v5/market/tickers",
                      params=dict(category="linear"), timeout=15).json()
     rows = [x for x in t["result"]["list"] if x["symbol"].endswith("USDT")
@@ -46,8 +109,8 @@ def klines(symbol, interval, limit=250):
     df["t"] = pd.to_datetime(df["t"], unit="ms")
     return df.sort_values("t").reset_index(drop=True)
 
-def klines_multi(symbol, interval, total=3000):
-    """Sayfa sayfa geriye giderek uzun geçmiş (backtest ~31 gün)"""
+def klines_multi(symbol, interval, total=6000):
+    """Sayfa sayfa geriye giderek uzun geçmiş (derin backtest ~62 gün)."""
     pages, end = [], None
     while sum(len(p) for p in pages) < total:
         params = dict(category="linear", symbol=symbol,
@@ -146,11 +209,11 @@ def _finish(ctx, name, direction, zone_bottom, zone_top, extra_conf, require_con
     return dict(symbol=ctx["symbol"], strategy=name, direction=direction,
                 entry=px, sl=sl, tp=tp, rr=round(rr, 2), score=min(score, 100),
                 confluences=conf, candle=cname or "Onaysız",
+                zone=(float(zone_bottom), float(zone_top)),
                 time=ctx["ltf"]["t"].iloc[-1])
 
 # ---------------- Stratejiler ----------------
 def strategy_pullback(ctx):
-    """S1 (CANLIDA KAPALI — backtest izlemede)"""
     for d in ("LONG", "SHORT"):
         if ctx["htf_trend"] != ("BULLISH" if d == "LONG" else "BEARISH"):
             continue
@@ -167,7 +230,6 @@ def strategy_pullback(ctx):
     return None
 
 def strategy_fvg(ctx):
-    """S2 (CANLIDA KAPALI — backtest izlemede)"""
     for d in ("LONG", "SHORT"):
         if ctx["htf_trend"] != ("BULLISH" if d == "LONG" else "BEARISH"):
             continue
@@ -181,7 +243,6 @@ def strategy_fvg(ctx):
     return None
 
 def strategy_sweep(ctx):
-    """S3: Likidite süpürmesi + reversasyon (onay + bölge şartı)"""
     lows  = [s.price for s in ctx["ltf_swings"] if s.kind == "L"][-2:]
     highs = [s.price for s in ctx["ltf_swings"] if s.kind == "H"][-2:]
     if ctx["sweep"]["bull"]:
@@ -199,7 +260,6 @@ def strategy_sweep(ctx):
     return None
 
 def strategy_breaker(ctx):
-    """S4: Breaker Block — trend uyumu zorunlu"""
     for d in ("LONG", "SHORT"):
         want = "BULLISH" if d == "LONG" else "BEARISH"
         if ctx["htf_trend"] != want:
@@ -217,8 +277,9 @@ def strategy_breaker(ctx):
                                ["Bullish OB kırıldı → breaker direnç testi"])
     return None
 
-STRATS = [strategy_pullback, strategy_fvg, strategy_sweep, strategy_breaker]  # hepsi (backtest için)
+STRATS = [strategy_pullback, strategy_fvg, strategy_sweep, strategy_breaker]
 _BY_NAME = {f.__name__: f for f in STRATS}
+ACTIVE_STRATS = ["strategy_sweep", "strategy_breaker"]   # canlıda açık stratejiler
 
 # ---------------- Tarama ----------------
 def analyze(symbol):
@@ -236,7 +297,7 @@ def analyze(symbol):
     except Exception:
         return None
 
-def scan(limit=100, workers=8):
+def scan(limit=MCAP_TOP, workers=8):
     syms = universe(limit)
     results = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -288,15 +349,14 @@ ZAMAN DİLİMİ : 15M (Giriş) / 1H (Trend)
    Pozisyon     : {qty:.6g} adet
 
 5️⃣ ÇIKIŞ PLANI (kısmi TP)
-   1R seviyesi  : {sig['entry'] + (sig['tp']-sig['entry'] and 0) + (1 if sig['direction']=='LONG' else -1) * abs(sig['entry']-sig['sl']):.6g}
-   Plan         : %50 kâr @1R → SL girişe çekilir (BE) → kalan %50 @TP
    TP           : {sig['tp']:.6g}
-   Risk:Ödül    : 1 : {sig['rr']} (tam TP'de)
+   Plan         : %50 kâr @1R → SL girişe (BE) → kalan %50 @TP
+   Risk:Ödül    : 1 : {sig['rr']}
    Beklenen Kâr : +{pl:.2f} USDT
 """
 
 if __name__ == "__main__":
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else MCAP_TOP
     balance = float(sys.argv[2]) if len(sys.argv) > 2 else 1000
     res = scan(n)
     if not res:

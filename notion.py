@@ -1,7 +1,16 @@
-"""SMC sinyallerini Notion'a yazar (v3: Tarih sütunu + aynı gün kopya koruması).
-Bağımsız: python notion.py 10   |   report.py içinden: notion.write_signals(sigs, top=10)"""
-import sys
+"""SMC sinyallerini Notion'a yazar — SON SÜRÜM.
+- Sırlar config.py'den okunur (repoya girmez)
+- Tarih sütunu: Date + saat (TR, UTC+3) | Ad başlığı da TR saatiyle
+- TF sütunu: 15M (Giriş) / 1H (Trend)
+- Aynı gün kopya koruması (aynı coin+strateji+yön tekrar yazılmaz)
+- page_id kaydı + update_result() → paper trade sonuçları 'Sonuç' sütununa yazar
+
+Kullanım:
+  bağımsız test      : python notion.py 10
+  report.py içinden  : notion.write_signals(sigs, top=10)
+"""
 from datetime import datetime, timezone, timedelta
+import sys
 import requests
 import scanner
 
@@ -9,10 +18,11 @@ try:
     from config import NOTION_TOKEN, NOTION_DB_ID
 except ImportError:
     raise SystemExit("config.py yok! config_örnek.py'i config.py olarak kopyala, değerleri doldur.")
+
 TOKEN = NOTION_TOKEN
 DB    = NOTION_DB_ID
 VER   = "2022-06-28"
-TR    = timezone(timedelta(hours=3))         # Türkiye saati
+TR    = timezone(timedelta(hours=3))   # Türkiye saati (UTC+3)
 
 def _headers():
     return {"Authorization": f"Bearer {TOKEN}",
@@ -24,8 +34,8 @@ def _txt(props, name):
     return parts[0].get("plain_text", "") if parts else ""
 
 def _existing_today():
-    """Bugün zaten yazılmış (Parite, Strateji, Yön) üçlülerini döndürür.
-    Tarih sütunu yoksa/hata olursa boş küme → her şey yazılır (eski davranış)."""
+    """Bugün (TR) zaten yazılmış (Parite, Strateji, Yön) üçlülerini döndürür.
+    Sorgu başarısızsa boş küme döner → her şey yazılmaya çalışılır (güvenli davranış)."""
     today = datetime.now(TR).strftime("%Y-%m-%d")
     try:
         r = requests.post(f"https://api.notion.com/v1/databases/{DB}/query",
@@ -44,7 +54,8 @@ def _existing_today():
         return set()
 
 def _page(r, risk_pct=1.0, balance=1000.0):
-    t_tr = r["time"] + timedelta(hours=3)   # mum zamanı UTC → TR
+    """Bir sinyali Notion sayfa objesine çevirir (mum saati UTC → TR çevrilir)."""
+    t_tr = r["time"] + timedelta(hours=3)
     risk_amt = balance * risk_pct / 100
     qty = risk_amt / abs(r["entry"] - r["sl"])
     arrow = "LONG" if r["direction"] == "LONG" else "SHORT"
@@ -75,7 +86,8 @@ def _page(r, risk_pct=1.0, balance=1000.0):
 
 def write_signals(res, top=10, balance=1000.0, risk_pct=1.0):
     """Sinyal listesini Notion'a yazar. Aynı gün içinde aynı (coin+strateji+yön)
-    zaten varsa ATLANIR — taze tarihle tekrar yazılmaz."""
+    zaten varsa ATLANIR. Başarılı yazımda sinyal dict'ine notion_page_id eklenir
+    (paper motoru sonuç yazarken kullanır). Dönen değer: yazılan sayısı."""
     if not res:
         print("Notion: yazılacak sinyal yok.")
         return 0
@@ -93,6 +105,7 @@ def write_signals(res, top=10, balance=1000.0, risk_pct=1.0):
                                  json=_page(r, risk_pct, balance), timeout=15)
             if resp.status_code in (200, 201):
                 ok += 1
+                r["notion_page_id"] = resp.json().get("id")
             else:
                 print(f"  ⚠ Notion {r['symbol']}: HTTP {resp.status_code} — {resp.text[:150]}")
         except Exception as e:
@@ -101,9 +114,24 @@ def write_signals(res, top=10, balance=1000.0, risk_pct=1.0):
           (f", {atlanan} kopya atlandı (bugün zaten vardı)." if atlanan else "."))
     return ok
 
+def update_result(page_id, text):
+    """Kapanan paper pozisyonunun sonucunu Notion'daki 'Sonuç' sütununa yazar."""
+    try:
+        r = requests.patch(f"https://api.notion.com/v1/pages/{page_id}",
+                           headers=_headers(),
+                           json={"properties": {"Sonuç": {"rich_text": [{"text": {"content": text}}]}}},
+                           timeout=15)
+        if r.status_code != 200:
+            print(f"  ⚠ Notion Sonuç yazılamadı: HTTP {r.status_code} ('Sonuç' sütunu var mı?)")
+    except Exception as e:
+        print(f"  ⚠ Notion Sonuç güncellenemedi: {e!r}")
+
 def send_signals(top=10, balance=1000.0, risk_pct=1.0):
-    """Bağımsız mod: kendisi tarar ve yazar"""
-    res = scanner.scan(100)
+    """Bağımsız mod: kendisi tarar ve yazar (hızlı test için; rutin akış report.py'dir)."""
+    res = scanner.scan()
+    if not res:
+        print("Sinyal yok — Notion'a yazılacak bir şey bulunamadı.")
+        return
     write_signals(res, top, balance, risk_pct)
 
 if __name__ == "__main__":
