@@ -1,10 +1,15 @@
-"""Maximum Pain Level (MPL) — v1.2.4
-v1.2.4 FIX: bacak kökü tanımı daraltıldı.
-  ESKİ (hatalı): MSB'den geriye pencere EN DERİN dibi alıyordu → risk patlıyor, TP ulaşılmaz
-  YENİ: MSB'den geriye İLK ONAYLI 15M swing low = yükseliş bacağının başladığı dip.
-        (Kullanıcı çizimindeki 'hareketin kökü' tam olarak bu dönüş noktası.)
-  Sonra kök zamanı 1H'a map'lenir (±1 mum penceresi min low) + yapısal extreme güvencesi.
-v1.2: TP=2R sabit, kısmi TP kapalı | v1.1: IDM şartı | havuz: birbirini yememiş tepe/dip"""
+"""Maximum Pain Level (MPL) — v1.3.1
+v1.3.1 FIX (kullanıcı grafik bulgusu): DÜŞEN trendin ortasında sahte sinyal.
+  Kök neden: havuz-süpürme bağlantısı hiç test edilmiyordu; Idm gevşek; MSB stale-HL
+  ile tetiklenebiliyordu.
+  Düzeltmeler:
+  A) SÜPÜRME ZORUNLU: son 8×15M mumda havuz top'unu AŞAN + havuz altına KAPANAN mum
+     aranır (multisweep mantığı). Yoksa → sinyal yok.
+  B) Idm sıkılaştı: süpürme mumundan önceki 20 mumda ara tepe, VE havuz top'unun
+     ALTINDA olmalı (Idm = süpürülene kadar alınmamış ara likidite).
+  C) MSB tazelik: HL altına kapanıştan ÖNCE son 20 mum içinde HL ÜSTÜNDE kapanış
+     olmalı (yapı gerçekten kırılıyor, çoktan kırılmış değil).
+Zincir: havuz → süpürme → Idm → MSB → FVG %50 limit → kök-SL → havuz-TP."""
 import numpy as np
 import pandas as pd
 import smc
@@ -14,40 +19,32 @@ TOL_ATR          = 0.35
 LTF_EXPIRY_BARS  = 96
 IDM_WINDOW       = 20
 IDM_PROMINENCE   = 1.0
-TP_R             = 2.0
-MAX_RISK_PCT     = 0.05   # güvenlik: risk, fiyatın %5'ini aşamaz (bozuk geometri koruması)
+MIN_RR_STRUCTURE = 1.0
+MAX_RISK_PCT     = 0.05
+SWEEP_WINDOW     = 8     # havuz süpürmesi aranacak son N×15M mum
+MSB_FRESH_WINDOW = 20    # MSB tazeliği: HL üstünde kapanış aralığı
 
-def _find_idm_high(df, end_idx: int):
+def _find_idm_high(df, end_idx):
     start = max(0, end_idx - IDM_WINDOW)
-    if end_idx - start < 5:
-        return None
-    h = df["high"].values
-    l = df["low"].values
+    if end_idx - start < 5: return None
+    h = df["high"].values; l = df["low"].values
     atr = float((df["high"] - df["low"]).rolling(14).mean().iloc[:end_idx].iloc[-1] or 0)
-    if atr <= 0:
-        return None
-    window_top = float(h[start:end_idx].max())
-    window_bot = float(l[start:end_idx].min())
-    if (window_top - window_bot) < IDM_PROMINENCE * atr:
-        return None
-    return window_top
+    if atr <= 0: return None
+    top = float(h[start:end_idx].max()); bot = float(l[start:end_idx].min())
+    if (top - bot) < IDM_PROMINENCE * atr: return None
+    return top
 
-def _find_idm_low(df, end_idx: int):
+def _find_idm_low(df, end_idx):
     start = max(0, end_idx - IDM_WINDOW)
-    if end_idx - start < 5:
-        return None
-    h = df["high"].values
-    l = df["low"].values
+    if end_idx - start < 5: return None
+    h = df["high"].values; l = df["low"].values
     atr = float((df["high"] - df["low"]).rolling(14).mean().iloc[:end_idx].iloc[-1] or 0)
-    if atr <= 0:
-        return None
-    window_bot = float(l[start:end_idx].min())
-    window_top = float(h[start:end_idx].max())
-    if (window_top - window_bot) < IDM_PROMINENCE * atr:
-        return None
-    return window_bot
+    if atr <= 0: return None
+    bot = float(l[start:end_idx].min()); top = float(h[start:end_idx].max())
+    if (top - bot) < IDM_PROMINENCE * atr: return None
+    return bot
 
-def _clean_pool(prices_idx: list, highs: list) -> list:
+def _clean_pool(prices_idx, highs):
     members = []
     for k, (px, ix) in enumerate(prices_idx):
         if k == 0:
@@ -96,45 +93,36 @@ def _pool_stats(df, swings, kind):
                               top=max(g[0] for g in group), bottom=min(g[0] for g in group)))
     return pools
 
-def _leg_root_time(ltf, msb_idx: int, ltf_swings) -> tuple:
-    """SHORT: MSB'den geriye İLK onaylı 15M swing low = yükselişin başladığı dip (kök)."""
+def _leg_root_time(ltf, msb_idx, ltf_swings):
     for s in sorted(ltf_swings, key=lambda s: -s.idx):
         if s.idx < msb_idx and s.kind == "L":
-            return ltf.loc[s.idx, "t"], float(ltf.loc[s.idx, "low"])
-    # swing yoksa (nadir): 10 mumluk mini pencere dibi
+            return ltf.loc[s.idx, "t"]
     window = ltf.iloc[max(0, msb_idx - 10):msb_idx + 1]
-    lo_i = window["low"].idxmin()
-    return ltf.loc[lo_i, "t"], float(ltf.loc[lo_i, "low"])
+    return ltf.loc[window["low"].idxmin(), "t"]
 
-def _leg_root_time_long(ltf, msb_idx: int, ltf_swings) -> tuple:
-    """LONG: MSB'den geriye İLK onaylı 15M swing high = düşüşün başladığı tepe (kök)."""
+def _leg_root_time_long(ltf, msb_idx, ltf_swings):
     for s in sorted(ltf_swings, key=lambda s: -s.idx):
         if s.idx < msb_idx and s.kind == "H":
-            return ltf.loc[s.idx, "t"], float(ltf.loc[s.idx, "high"])
+            return ltf.loc[s.idx, "t"]
     window = ltf.iloc[max(0, msb_idx - 10):msb_idx + 1]
-    hi_i = window["high"].idxmax()
-    return ltf.loc[hi_i, "t"], float(ltf.loc[hi_i, "high"])
+    return ltf.loc[window["high"].idxmax(), "t"]
 
 def _sl_anchor_short_1h(htf, root_time, htf_swings):
     hs = [s.price for s in htf_swings if s.kind == "H"]
     idx_near = int((htf["t"] - root_time).abs().idxmin())
-    start = max(0, idx_near - 1)
-    end = min(len(htf), idx_near + 2)
-    root_low = float(htf["low"].iloc[start:end].min())
+    root_low = float(htf["low"].iloc[max(0, idx_near - 1):min(len(htf), idx_near + 2)].min())
     structural = hs[-1] if hs else None
     if structural:
-        return max(root_low, min(structural, root_low + (root_low * 0.02)))
+        return max(root_low, min(structural, root_low + root_low * 0.02))
     return root_low
 
 def _sl_anchor_long_1h(htf, root_time, htf_swings):
     ls = [s.price for s in htf_swings if s.kind == "L"]
     idx_near = int((htf["t"] - root_time).abs().idxmin())
-    start = max(0, idx_near - 1)
-    end = min(len(htf), idx_near + 2)
-    root_high = float(htf["high"].iloc[start:end].max())
+    root_high = float(htf["high"].iloc[max(0, idx_near - 1):min(len(htf), idx_near + 2)].max())
     structural = ls[-1] if ls else None
     if structural:
-        return min(root_high, max(structural, root_high - (root_high * 0.02)))
+        return min(root_high, max(structural, root_high - root_high * 0.02))
     return root_high
 
 def signal(ctx):
@@ -146,109 +134,126 @@ def signal(ctx):
     ltf_swings = smc.find_swings(ltf)
     h_lows  = [s for s in htf_swings if s.kind == "L"]
     h_highs = [s for s in htf_swings if s.kind == "H"]
+    h = ltf["high"].values; l = ltf["low"].values; c = ltf["close"].values
 
-    # ---------- SHORT ----------
-    if h_lows:
+    # ---------- SHORT: eşit-TEPE havuzu → süpürme → Idm → MSB → FVG %50 ----------
+    pools_h = _pool_stats(ltf, ltf_swings, "H")
+    for pool in pools_h:
+        # (A) SÜPÜRME ZORUNLU: son SWEEP_WINDOW mumda top'u aşan + altına kapanan mum
+        sweep_i = None
+        for j in range(max(0, n15 - SWEEP_WINDOW), n15):
+            if h[j] > pool["top"] and c[j] < pool["top"]:
+                sweep_i = j; break
+        if sweep_i is None:
+            continue                                   # havuz süpürülmemiş → sıradaki havuz
+        # (B) Idm: süpürmeden önceki ara tepe — havuzun ALTINDA kalmalı
+        idm = _find_idm_high(ltf, sweep_i)
+        if idm is None or idm >= pool["top"]:
+            continue
+        # (C) MSB tazeliği: süpürmeden önce HL ÜSTÜNDE kapanış, sonra altında kapanış
+        if not h_lows:
+            continue
         hl_price = h_lows[-1].price
-        closes = ltf["close"].values[-3:]
-        msb_idx = None
-        for k in range(len(closes) - 1, -1, -1):
-            if closes[k] < hl_price:
-                msb_idx = n15 - (len(closes) - k); break
-        if msb_idx is None:
-            return None
-        idm = _find_idm_high(ltf, msb_idx)
-        if idm is None:
-            return None
+        if c[sweep_i] >= hl_price:
+            continue                                    # süpürme mumu hâlâ HL üstünde → MSB yok
+        prev_close = c[max(0, sweep_i - MSB_FRESH_WINDOW):sweep_i]
+        if not (prev_close > hl_price).any():
+            continue                                    # çoktan kırılmıştı (stale HL) → geçersiz
+        # (D) FVG: süpürme sonrası çöküşün bıraktığı bearish FVG
         cands = [f for f in ctx["fvgs"] if f["type"] == "bearish" and not f["filled"]
-                 and abs(f["idx"] - msb_idx) <= 4]
+                 and f["idx"] >= sweep_i - 1]
         if not cands:
-            return None
+            continue
         fvg = max(cands, key=lambda f: (f["top"] - f["bottom"]))
         mid = (fvg["top"] + fvg["bottom"]) / 2.0
         if ctx["price"] >= mid:
-            return None
-        pools_h = _pool_stats(htf, htf_swings, "H") or _pool_stats(ltf, ltf_swings, "H")
-        pools_h = [p for p in pools_h if p["level"] > fvg["top"]]
-        score = 25
-        members = max((p["members"] for p in pools_h), default=0)
-        if members >= POOL_MIN_MEMBERS:
-            score += 5 + 5 * (members - POOL_MIN_MEMBERS)
-            if members >= 3: score += 5
-        else:
-            return None
-        if any(f["bottom"] > p["level"] for p in pools_h for f in [fvg]):
-            score += 10
+            continue                                    # fiyat henüz geri dönmedi → limit bekler
+        # havuz sayısı puanı (süpürülen bu havuz)
+        members = pool["members"]
+        score = 25 + 5 + 5 * (members - POOL_MIN_MEMBERS)
+        if members >= 3: score += 5
+        score += 10                                     # Idm kalite bonusu
         if ctx["sweep"]["bear"]: score += 5
-        score += 10
-        root_time, _ = _leg_root_time(ltf, msb_idx, ltf_swings)
+        # SL: bacak kökü 1H extreme
+        root_time = _leg_root_time(ltf, sweep_i, ltf_swings)
         anchor = _sl_anchor_short_1h(htf, root_time, htf_swings)
         sl = anchor + max(ctx["atr"] * 0.25, ctx["price"] * 0.0015)
         risk = sl - mid
-        # v1.2.4 güvenlik: risk fiyatın %5'ini aşamaz (geometri koruması)
         if risk <= 0 or risk > ctx["price"] * MAX_RISK_PCT:
-            return None
-        tp = mid - TP_R * risk
-        rr = TP_R
-        conf = [f"MPL: {members} üyeli tepe havuzu (likidite almamış)",
-                "MSB: 1H HL altına 15M kapanış",
-                f"IDM alındı: ara tepe {idm:.6g} süpürüldü",
+            continue
+        # TP: karşı (dip) havuzu — yoksa işlemin ilkesi yok
+        pools_l = _pool_stats(ltf, ltf_swings, "L")
+        cand_tp = [p for p in pools_l if p["level"] < ctx["price"]]
+        if not cand_tp:
+            continue
+        tp_pool = max(cand_tp, key=lambda p: (p["members"], p["level"]))
+        tp = tp_pool["level"]
+        rr = (mid - tp) / risk
+        if rr < MIN_RR_STRUCTURE:
+            continue
+        conf = [f"MPL: {members} üyeli tepe havuzu süpürüldü (Idm aşılı)",
+                "MSB: 1H HL altına TAZE 15M kapanış",
                 "Giriş: FVG %50 (CE) limit — 24s ömür",
-                f"SL: bacak kökü (ilk swing low) 1H extreme {anchor:.6g}+",
-                f"TP: sabit {TP_R}R (kısmi TP kapalı)"]
+                f"SL: bacak kökü 1H extreme {anchor:.6g}+ (kural)",
+                f"TP: {tp_pool['members']} üyeli dip havuzu {tp:.6g} (yapısal)"]
         return dict(kind="MPL_PENDING", symbol=ctx["symbol"], strategy="Maximum Pain Level",
                     direction="SHORT", limit=mid, sl=sl, tp=tp, rr=round(rr, 2),
                     score=min(score, 100), expiry_bars=LTF_EXPIRY_BARS,
                     confluences=conf, time=ltf["t"].iloc[-1])
 
-    # ---------- LONG (ayna) ----------
-    if h_highs:
+    # ---------- LONG: eşit-DİP havuzu → süpürme → Idm → MSB → FVG %50 (ayna) ----------
+    pools_l = _pool_stats(ltf, ltf_swings, "L")
+    for pool in pools_l:
+        sweep_i = None
+        for j in range(max(0, n15 - SWEEP_WINDOW), n15):
+            if l[j] < pool["bottom"] and c[j] > pool["bottom"]:
+                sweep_i = j; break
+        if sweep_i is None:
+            continue
+        idm = _find_idm_low(ltf, sweep_i)
+        if idm is None or idm <= pool["bottom"]:
+            continue
+        if not h_highs:
+            continue
         lh_price = h_highs[-1].price
-        closes = ltf["close"].values[-3:]
-        msb_idx = None
-        for k in range(len(closes) - 1, -1, -1):
-            if closes[k] > lh_price:
-                msb_idx = n15 - (len(closes) - k); break
-        if msb_idx is None:
-            return None
-        idm = _find_idm_low(ltf, msb_idx)
-        if idm is None:
-            return None
+        if c[sweep_i] <= lh_price:
+            continue
+        prev_close = c[max(0, sweep_i - MSB_FRESH_WINDOW):sweep_i]
+        if not (prev_close < lh_price).any():
+            continue
         cands = [f for f in ctx["fvgs"] if f["type"] == "bullish" and not f["filled"]
-                 and abs(f["idx"] - msb_idx) <= 4]
+                 and f["idx"] >= sweep_i - 1]
         if not cands:
-            return None
+            continue
         fvg = max(cands, key=lambda f: (f["top"] - f["bottom"]))
         mid = (fvg["top"] + fvg["bottom"]) / 2.0
         if ctx["price"] <= mid:
-            return None
-        pools_l = _pool_stats(htf, htf_swings, "L") or _pool_stats(ltf, ltf_swings, "L")
-        pools_l = [p for p in pools_l if p["level"] < fvg["bottom"]]
-        score = 25
-        members = max((p["members"] for p in pools_l), default=0)
-        if members >= POOL_MIN_MEMBERS:
-            score += 5 + 5 * (members - POOL_MIN_MEMBERS)
-            if members >= 3: score += 5
-        else:
-            return None
-        if any(f["top"] < p["level"] for p in pools_l for f in [fvg]):
-            score += 10
-        if ctx["sweep"]["bull"]: score += 5
+            continue
+        members = pool["members"]
+        score = 25 + 5 + 5 * (members - POOL_MIN_MEMBERS)
+        if members >= 3: score += 5
         score += 10
-        root_time, _ = _leg_root_time_long(ltf, msb_idx, ltf_swings)
+        if ctx["sweep"]["bull"]: score += 5
+        root_time = _leg_root_time_long(ltf, sweep_i, ltf_swings)
         anchor = _sl_anchor_long_1h(htf, root_time, htf_swings)
         sl = anchor - max(ctx["atr"] * 0.25, ctx["price"] * 0.0015)
         risk = mid - sl
         if risk <= 0 or risk > ctx["price"] * MAX_RISK_PCT:
-            return None
-        tp = mid + TP_R * risk
-        rr = TP_R
-        conf = [f"MPL: {members} üyeli dip havuzu (likidite almamış)",
-                "MSB: 1H LH üstüne 15M kapanış",
-                f"IDM alındı: ara dip {idm:.6g} süpürüldü",
+            continue
+        pools_h = _pool_stats(ltf, ltf_swings, "H")
+        cand_tp = [p for p in pools_h if p["level"] > ctx["price"]]
+        if not cand_tp:
+            continue
+        tp_pool = max(cand_tp, key=lambda p: (p["members"], p["level"]))
+        tp = tp_pool["level"]
+        rr = (tp - mid) / risk
+        if rr < MIN_RR_STRUCTURE:
+            continue
+        conf = [f"MPL: {members} üyeli dip havuzu süpürüldü (Idm aşılı)",
+                "MSB: 1H LH üstüne TAZE 15M kapanış",
                 "Giriş: FVG %50 (CE) limit — 24s ömür",
-                f"SL: bacak kökü (ilk swing high) 1H extreme {anchor:.6g}-",
-                f"TP: sabit {TP_R}R (kısmi TP kapalı)"]
+                f"SL: bacak kökü 1H extreme {anchor:.6g}- (kural)",
+                f"TP: {tp_pool['members']} üyeli tepe havuzu {tp:.6g} (yapısal)"]
         return dict(kind="MPL_PENDING", symbol=ctx["symbol"], strategy="Maximum Pain Level",
                     direction="LONG", limit=mid, sl=sl, tp=tp, rr=round(rr, 2),
                     score=min(score, 100), expiry_bars=LTF_EXPIRY_BARS,
