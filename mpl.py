@@ -1,29 +1,22 @@
-"""Maximum Pain Level (MPL) stratejisi — v1.1.1
-v1.1.1: LONG dalındaki çift atama hatası düzeltildi
-        (idm = _find_idm_high = _find_idm_low(...) → idm = _find_idm_low(...))
-        Bu hata UnboundLocalError'a yol açıyordu: atama, _find_idm_high'ı
-        signal() içinde yerel değişken yapıyordu.
-v1.1: IDM (Inducement) şartı:
-  SHORT: süpürme mumundan önceki son 20 mumda belirgin ARA SWING HIGH olmalı
-         ve süpürme displacement'ı bu ara tepeyi AŞMALI ("Idm alınmış").
-Kavram: Eşit-tepe/dip havuzları (birbirinin likiditesini almamış) + 1H HL altına
-15M kapanış (MSB) + çöküş FVG %50'sine limit emir (24s ömür).
-SL: her zaman HL noktası. TP: karşı en yoğun havuz, yoksa 2.5R."""
+"""Maximum Pain Level (MPL) stratejisi — v1.2
+v1.2 (ÇIKIŞ DENEMESİ — kullanıcı onaylı):
+  - TP: alt/üst likidite havuzu yerine SABİT 2.0R
+  - Kısmi TP (%50 @1R + BE) KAPALI → tam 2R tek çıkış
+  Gerekçe: v9.4 yolculuk analizi — MFE≥2R gören 120 işlemin %96.7'si uzak TP'ye
+  varamadan kapanıyordu (ort.MFE +4.82R). TP=2R + tek çıkış hesabı: EV ≈ +0.29R.
+Sabitler: Idm şartı (v1.1), SL=HL+ATR (kullanıcı kuralı), FVG %50 limit, 24s ömür."""
 import numpy as np
 import pandas as pd
 import smc
 
 POOL_MIN_MEMBERS = 2
 TOL_ATR          = 0.35
-MSB_LB           = 3
 LTF_EXPIRY_BARS  = 96
-FEE_RR_GUARD     = 1.5
 IDM_WINDOW       = 20
 IDM_PROMINENCE   = 1.0
+TP_R             = 2.0     # v1.2: sabit hedef (R)
 
 def _find_idm_high(df, end_idx: int):
-    """SHORT: end_idx (MSB mumu) öncesi IDM_WINDOW içinde en yüksek fitil (ara tepe).
-    Belirginlik: tepe-dip aralığı ≥ IDM_PROMINENCE*ATR. Yoksa None."""
     start = max(0, end_idx - IDM_WINDOW)
     if end_idx - start < 5:
         return None
@@ -39,7 +32,6 @@ def _find_idm_high(df, end_idx: int):
     return window_top
 
 def _find_idm_low(df, end_idx: int):
-    """LONG aynası: ara dip (fitil) + belirginlik şartı."""
     start = max(0, end_idx - IDM_WINDOW)
     if end_idx - start < 5:
         return None
@@ -109,13 +101,12 @@ def signal(ctx):
     if n15 < 60:
         return None
     htf_swings = ctx["htf_swings"]
-    ltf_swings = smc.find_swings(ltf)
     h_lows  = [s for s in htf_swings if s.kind == "L"]
     h_highs = [s for s in htf_swings if s.kind == "H"]
 
     # ---------- SHORT ----------
     if h_lows:
-        hl = h_lows[-1]; hl_price = hl.price
+        hl_price = h_lows[-1].price
         closes = ltf["close"].values[-3:]
         msb_idx = None
         for k in range(len(closes) - 1, -1, -1):
@@ -123,7 +114,7 @@ def signal(ctx):
                 msb_idx = n15 - (len(closes) - k); break
         if msb_idx is None:
             return None
-        idm = _find_idm_high(ltf, msb_idx)          # DÜZELTİLDİ: tek atama
+        idm = _find_idm_high(ltf, msb_idx)
         if idm is None:
             return None
         cands = [f for f in ctx["fvgs"] if f["type"] == "bearish" and not f["filled"]
@@ -150,18 +141,15 @@ def signal(ctx):
         atr15 = ctx["atr"]
         sl = hl_price + max(atr15 * 0.25, ctx["price"] * 0.0015)
         risk = sl - mid
-        if risk <= 0: return None
-        pools_l = _pool_stats(ltf, ltf_swings, "L")
-        cand_tp = [p for p in pools_l if p["level"] < ctx["price"]]
-        tp = max(cand_tp, key=lambda p: (p["members"], p["level"]))["level"] if cand_tp \
-             else mid - 2.5 * risk
-        if (mid - tp) < FEE_RR_GUARD * risk:
-            tp = mid - 2.5 * risk
-        rr = (mid - tp) / risk
+        if risk <= 0:
+            return None
+        tp = mid - TP_R * risk                    # v1.2: SABİT 2R
+        rr = TP_R
         conf = [f"MPL: {members} üyeli tepe havuzu (likidite almamış)",
                 "MSB: 1H HL altına 15M kapanış",
                 f"IDM alındı: ara tepe {idm:.6g} süpürüldü",
-                "Giriş: FVG %50 (CE) limit — 24s ömür"]
+                f"Giriş: FVG %50 (CE) limit — 24s ömür",
+                f"TP: sabit {TP_R}R (kısmi TP kapalı)"]
         return dict(kind="MPL_PENDING", symbol=ctx["symbol"], strategy="Maximum Pain Level",
                     direction="SHORT", limit=mid, sl=sl, tp=tp, rr=round(rr, 2),
                     score=min(score, 100), expiry_bars=LTF_EXPIRY_BARS,
@@ -169,7 +157,7 @@ def signal(ctx):
 
     # ---------- LONG (ayna) ----------
     if h_highs:
-        lh = h_highs[-1]; lh_price = lh.price
+        lh_price = h_highs[-1].price
         closes = ltf["close"].values[-3:]
         msb_idx = None
         for k in range(len(closes) - 1, -1, -1):
@@ -177,7 +165,7 @@ def signal(ctx):
                 msb_idx = n15 - (len(closes) - k); break
         if msb_idx is None:
             return None
-        idm = _find_idm_low(ltf, msb_idx)           # DÜZELTİLDİ: tek atama
+        idm = _find_idm_low(ltf, msb_idx)
         if idm is None:
             return None
         cands = [f for f in ctx["fvgs"] if f["type"] == "bullish" and not f["filled"]
@@ -204,17 +192,15 @@ def signal(ctx):
         atr15 = ctx["atr"]
         sl = lh_price - max(atr15 * 0.25, ctx["price"] * 0.0015)
         risk = mid - sl
-        if risk <= 0: return None
-        pools_h = _pool_stats(ltf, ltf_swings, "H")
-        cand_tp = [p for p in pools_h if p["level"] > ctx["price"]]
-        tp = max(cand_tp, key=lambda p: (p["members"], p["level"]))["level"] if cand_tp \
-             else mid + 2.5 * risk
-        if (tp - mid) < FEE_RR_GUARD * risk: tp = mid + 2.5 * risk
-        rr = (tp - mid) / risk
+        if risk <= 0:
+            return None
+        tp = mid + TP_R * risk                    # v1.2: SABİT 2R
+        rr = TP_R
         conf = [f"MPL: {members} üyeli dip havuzu (likidite almamış)",
                 "MSB: 1H LH üstüne 15M kapanış",
                 f"IDM alındı: ara dip {idm:.6g} süpürüldü",
-                "Giriş: FVG %50 (CE) limit — 24s ömür"]
+                f"Giriş: FVG %50 (CE) limit — 24s ömür",
+                f"TP: sabit {TP_R}R (kısmi TP kapalı)"]
         return dict(kind="MPL_PENDING", symbol=ctx["symbol"], strategy="Maximum Pain Level",
                     direction="LONG", limit=mid, sl=sl, tp=tp, rr=round(rr, 2),
                     score=min(score, 100), expiry_bars=LTF_EXPIRY_BARS,

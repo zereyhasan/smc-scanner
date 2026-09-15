@@ -459,7 +459,7 @@ def strategy_mpl(ctx):
                 confluences=s["confluences"], candle="Limit emir (CE %50)",
                 zone=(min(s["limit"], s["sl"]), max(s["limit"], s["sl"])),
                 time=ctx["ltf"]["t"].iloc[-1],
-                pending=True, expiry_bars=s["expiry_bars"])
+                pending=True, expiry_bars=s["expiry_bars"], no_partial=True)
 
 STRATS = [strategy_pullback, strategy_fvg, strategy_sweep,
           strategy_breaker, strategy_multisweep, strategy_mpl]

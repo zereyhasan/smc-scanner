@@ -1,9 +1,5 @@
-"""Backtest v9.4: derin araştırma + arşiv + HTML + PENDING simülasyonu + YOLCULUK VERİSİ.
-v9.4 yenilikleri:
-1) Pending sayaç FIX: 'orders' artık sinyal üretilirken sayılır → gerçek dolma oranı görünür
-2) Her işlem için YOLCULUK verisi: mfe_r (en iyi R), mae_r (en kötü R), exit_reason,
-   bars_held, be_moved → 'MFE≥2R ama TP'ye varamayan' analizi artık mümkün
-3) Terminal + HTML'e 'Yolculuk Analizi' tablosu (strateji × MFE kırılımı)
+"""Backtest v9.5: derin araştırma + arşiv + HTML + PENDING simülasyonu + YOLCULUK VERİSİ
++ strateji-başına no_partial desteği (MPL: tam 2R tek çıkış).
 Kullanım: python backtest.py [coins] [bars]"""
 import sys, json
 from datetime import datetime
@@ -16,7 +12,7 @@ import scanner
 FEE_RT   = 0.001
 WARMUP   = 220
 MAX_BARS = 96
-PARTIAL_TP = True
+PARTIAL_TP = True          # global varsayılan; sinyaldeki no_partial=True bunu ezer
 DEFAULT_COINS = 50
 DEFAULT_BARS  = 6000
 ARCHIVE_DIR = "backtest_arsiv"
@@ -73,13 +69,13 @@ def backtest_symbol(symbol: str, bars: int = DEFAULT_BARS) -> dict:
         return {}
     rank, cat = scanner.MCAP_RANK.get(symbol, (None, "—"))
     trades, detail = {f.__name__: [] for f in scanner.STRATS}, {}
-    pend_meta = {}   # name -> dict(orders, filled)
+    pend_meta = {}
     state = {}
     for i in range(WARMUP, len(ltf)):
         bar = ltf.iloc[i]
         # ---------- 1) Açık pozisyonları yönet ----------
         for name, p in list(state.items()):
-            d, entry, sl, tp, risk, i0, cost, half, etime, run = p
+            d, entry, sl, tp, risk, i0, cost, half, etime, run, no_partial = p
             r1 = entry + risk if d == "LONG" else entry - risk
             if d == "LONG":
                 hit_sl = bar["low"] <= sl
@@ -89,7 +85,6 @@ def backtest_symbol(symbol: str, bars: int = DEFAULT_BARS) -> dict:
                 hit_sl = bar["high"] >= sl
                 hit_r1 = (not half) and bar["low"]  <= r1
                 hit_tp = bar["low"]  <= tp
-            # --- yolculuk takibi: MFE / MAE (bu barda görülen ekstremumlar) ---
             if d == "LONG":
                 mfe_bar = (bar["high"] - entry) / risk
                 mae_bar = (bar["low"]  - entry) / risk
@@ -99,12 +94,12 @@ def backtest_symbol(symbol: str, bars: int = DEFAULT_BARS) -> dict:
             run["mfe"] = max(run["mfe"], mfe_bar)
             run["mae"] = min(run["mae"], mae_bar)
             run["bars"] += 1
-            # --- BE taşıma: %50 @1R ---
-            if PARTIAL_TP and hit_r1 and not half:
+            # --- %50 @1R → BE (no_partial ise atlanır: MPL tam 2R) ---
+            if PARTIAL_TP and (not no_partial) and hit_r1 and not half:
                 half = True
-                run["r_at_partial"] = r1
+                run["r_at_partial"] = float(r1)
                 run["be_moved"] = True
-                state[name] = (d, entry, entry, tp, risk, i0, cost, True, etime, run)
+                state[name] = (d, entry, entry, tp, risk, i0, cost, True, etime, run, no_partial)
                 continue
             exit_reason = None
             if hit_sl:
@@ -153,9 +148,10 @@ def backtest_symbol(symbol: str, bars: int = DEFAULT_BARS) -> dict:
                 risk = abs(sig["entry"] - sig["sl"])
                 if risk <= 0:
                     continue
+                no_partial = bool(sig.get("no_partial"))
                 pm = pend_meta.setdefault(fn.__name__, dict(orders=0, filled=0))
                 if sig.get("pending"):
-                    pm["orders"] += 1                     # FIX: sinyal üretilirken say
+                    pm["orders"] += 1
                     exp = sig.get("expiry_bars", 96)
                     limit_px = sig["entry"]
                     filled_i = None
@@ -163,29 +159,31 @@ def backtest_symbol(symbol: str, bars: int = DEFAULT_BARS) -> dict:
                         b = ltf.iloc[j]
                         if sig["direction"] == "LONG":
                             if b["low"] <= sig["sl"]:
-                                break                      # SL bölgesi görüldü → iptal
+                                break
                         else:
                             if b["high"] >= sig["sl"]:
                                 break
                         if b["low"] <= limit_px <= b["high"]:
                             filled_i = j; break
                     if filled_i is None:
-                        continue                           # dolmadı → işlem yok (orders sayıldı)
+                        continue
                     pm["filled"] += 1
                     entry, i0, e_time = limit_px, filled_i, ltf.iloc[filled_i]["t"]
                     cost = FEE_RT * entry / risk
                     state[fn.__name__] = (sig["direction"], entry, sig["sl"], sig["tp"],
                                           risk, i0, cost, False, e_time,
                                           dict(mfe=0.0, mae=0.0, bars=0,
-                                               be_moved=False, r_at_partial=None))
+                                               be_moved=False, r_at_partial=None),
+                                          no_partial)
                     continue
-                pm["orders"] += 1                          # market giriş da bir emirdir
+                pm["orders"] += 1
                 pm["filled"] += 1
                 cost = FEE_RT * sig["entry"] / risk
                 state[fn.__name__] = (sig["direction"], sig["entry"], sig["sl"],
                                       sig["tp"], risk, i, cost, False, sig["time"],
                                       dict(mfe=0.0, mae=0.0, bars=0,
-                                           be_moved=False, r_at_partial=None))
+                                           be_moved=False, r_at_partial=None),
+                                      no_partial)
     out = {}
     for fn in scanner.STRATS:
         m = _metrics(np.array(trades[fn.__name__]))
@@ -197,7 +195,7 @@ def backtest_symbol(symbol: str, bars: int = DEFAULT_BARS) -> dict:
         out[fn.__name__] = m
     return out
 
-# ---------------- Terminal yardımcıları ----------------
+# ---------------- Terminal / HTML yardımcıları ----------------
 def _agg_str(rs):
     rs = np.array(rs) if len(rs) else np.array([])
     if len(rs) == 0:
@@ -247,7 +245,6 @@ def backtest_all(n_coins=DEFAULT_COINS, bars=DEFAULT_BARS, workers=8, symbols=No
                   f"işlem={tot:4d}  WR={wr:5.1f}%  medyanPF={pfs[len(pfs)//2]:.2f}{extra}")
     return out
 
-# ---------------- Kırılımlar ----------------
 def _collect_trades(out: dict) -> list:
     rows = []
     for sym, ss in out.items():
@@ -292,9 +289,7 @@ def _breakdown_table_html(trades: list, key: str, order: list) -> str:
         return ""
     return f'<table><thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
 
-# ---------------- YENİ: Yolculuk Analizi ----------------
 def _journey_table(out: dict, mfe_threshold: float = 2.0) -> tuple:
-    """Strateji × MFE kırılımı: 'TP'ye varamadan X R gören işlemler' oranı."""
     rows_term, rows_html = [], []
     labs = next(iter(out.values())).keys()
     for lab in labs:
@@ -316,7 +311,7 @@ def _journey_table_html(rows_html, thr) -> str:
     if not rows_html:
         return ""
     head = ("<th>Strateji</th><th>İşlem</th><th>MFE≥" + f"{thr}R</th>"
-            f"<th>Bunlardan TP'siz kaplanan</th><th>Oran</th><th>Ort. MFE</th>")
+            "<th>TP'siz kapanan</th><th>Oran</th><th>Ort. MFE</th>")
     body = "".join(
         f'<tr><td class="left"><b>{scanner.STRAT_LABELS.get(lab, lab)}</b></td>'
         f'<td>{n}</td><td>{big}</td>'
@@ -386,8 +381,7 @@ def _research_html(trades, out, n, bars, ts_str, arch_name, thr=2.0) -> str:
 <h2>🪙 Coin × Strateji Detayı</h2>
 {coin_html}
 <p class="note">Renk: yeşil PF≥1.2 · sarı 1.0-1.2 · kırmızı &lt;1.0 · gri az örneklem.<br>
-MFE = işlem boyunca görülen en yüksek R. MFE≥{thr}R işlemlerin büyük kısmı TP'siz kapandıysa →
-TP hedefi geri çekilmeli (deney adayı). Arşiv: {arch_name}.</p>
+MFE = işlem boyunca görülen en yüksek R. Arşiv: {arch_name}.</p>
 </body></html>"""
 
 def research(n=DEFAULT_COINS, bars=DEFAULT_BARS):

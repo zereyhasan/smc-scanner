@@ -1,8 +1,5 @@
-"""Paper trade motoru v2.1 — BAKİYE + PENDING (limit emir) desteği.
-MPL gibi 'pending=True' sinyalleri 'pending' listesinde bekler:
-  - fiyat limit'e dokunursa → pozisyona dönüşür (bars sayacı başlar)
-  - expiry_bars boyunca dokunmazsa → emir iptal
-Aynı coin+strateji+yön pending'de/açıktayken tekrar emir açılmaz."""
+"""Paper trade motoru v2.2 — bakiye + pending + strateji-başına no_partial.
+no_partial=True sinyaller (MPL): %50 @1R + BE adımı atlanır → tam TP tek çıkış."""
 import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -52,8 +49,6 @@ def _equity_point(st):
         st["equity"] = st["equity"][-300:]
 
 def evaluate():
-    """1) Pending emirler: limit dokunuşu → pozisyon / expiry → iptal
-       2) Açık pozisyonlar: SL→BE→TP simülasyonu, kapanışlar bakiyeye işlenir."""
     st = _load()
     # ---- pending emirler ----
     still_pending = []
@@ -62,25 +57,26 @@ def evaluate():
             df = scanner.klines(o["symbol"], "15m", 200)
             last = datetime.fromisoformat(o["last_check"])
             candles = df[df["t"] > last]
-            filled = False
+            done = False
             for _, bar in candles.iterrows():
                 o["wait_bars"] += 1
-                touched = (bar["high"] >= o["limit"] >= bar["low"])
+                touched = (bar["low"] <= o["limit"] <= bar["high"])
                 if o["direction"] == "LONG":
-                    invalid = bar["high"] >= o["sl"]
-                else:
                     invalid = bar["low"] <= o["sl"]
+                else:
+                    invalid = bar["high"] >= o["sl"]
                 if touched:
-                    o["entry"] = o["limit"]          # limit fill
+                    o["entry"] = o["limit"]
                     st["open"].append(o)
-                    filled = True
-                    print(f"  ✎ Paper: {o['symbol']} MPL limit doldu → pozisyon")
+                    done = True
+                    print(f"  ✎ Paper: {o['symbol']} limit doldu → pozisyon")
                     break
                 if invalid or o["wait_bars"] >= o["expiry_bars"]:
-                    filled = True                    # iptal (open'a girmeden biter)
-                    print(f"  ✎ Paper: {o['symbol']} MPL emri {(o['wait_bars']>=o['expiry_bars']) and 'süre doldu' or 'SL seviyesi görüldü — iptal'}")
+                    done = True
+                    print(f"  ✎ Paper: {o['symbol']} emri iptal "
+                          f"({'SL bölgesi' if invalid else 'süre doldu'})")
                     break
-            if not filled:
+            if not done:
                 if len(candles):
                     o["last_check"] = str(candles["t"].iloc[-1])
                 still_pending.append(o)
@@ -89,7 +85,7 @@ def evaluate():
             still_pending.append(o)
     st["pending"] = still_pending
 
-    # ---- açık pozisyonlar (aynen v2) ----
+    # ---- açık pozisyonlar ----
     still = []
     for p in st["open"]:
         try:
@@ -97,20 +93,21 @@ def evaluate():
             last = datetime.fromisoformat(p["last_check"])
             candles = df[df["t"] > last]
             closed = False
+            no_partial = bool(p.get("no_partial"))
             for _, bar in candles.iterrows():
                 p["bars"] += 1
                 if p["direction"] == "LONG":
                     hit_sl = bar["low"]  <= p["sl"]
-                    hit_r1 = (not p["half"]) and bar["high"] >= p["r1"]
+                    hit_r1 = bar["high"] >= p["r1"]
                     hit_tp = bar["high"] >= p["tp"]
                 else:
                     hit_sl = bar["high"] >= p["sl"]
-                    hit_r1 = (not p["half"]) and bar["low"]  <= p["r1"]
+                    hit_r1 = bar["low"]  <= p["r1"]
                     hit_tp = bar["low"]  <= p["tp"]
                 if hit_sl:
                     r = (0.5 if p["half"] else -1.0)
                     cp, cat = p["sl"], (bar["t"] + timedelta(hours=3)).strftime("%d.%m %H:%M")
-                elif hit_r1:
+                elif (not no_partial) and hit_r1 and (not p["half"]):
                     p["half"] = True
                     p["last_check"] = str(bar["t"]); continue
                 elif hit_tp:
@@ -149,8 +146,6 @@ def evaluate():
     _save(st)
 
 def open_positions(sigs, max_open=MAX_OPEN, balance=None, risk_pct=RISK_PCT):
-    """pending=True sinyaller → 'pending' listesine limit emir;
-    normal sinyaller → doğrudan pozisyon (v2 davranışı)."""
     st = _load()
     bal = balance if balance is not None else st["balance"]
     have = {(p["symbol"], p["strategy"], p["direction"]) for p in st["open"]}
@@ -169,7 +164,8 @@ def open_positions(sigs, max_open=MAX_OPEN, balance=None, risk_pct=RISK_PCT):
                 continue
             if dir_count[d] >= MAX_SAME_DIR:
                 continue
-        risk = abs((s.get("limit", s["entry"])) - s["sl"])
+        ref_price = s.get("limit", s["entry"])
+        risk = abs(ref_price - s["sl"])
         if risk <= 0:
             continue
         risk_usdt = round(max(bal * risk_pct / 100, 1.0), 2)
@@ -177,8 +173,8 @@ def open_positions(sigs, max_open=MAX_OPEN, balance=None, risk_pct=RISK_PCT):
             st["pending"].append(dict(
                 symbol=s["symbol"], strategy=s["strategy"], direction=d,
                 limit=s["entry"], sl=s["sl"], tp=s["tp"], risk=risk,
-                risk_usdt=risk_usdt,
-                rr_raw=s["rr"], score=s["score"],
+                risk_usdt=risk_usdt, rr_raw=s["rr"], score=s["score"],
+                no_partial=bool(s.get("no_partial")),
                 expiry_bars=s.get("expiry_bars", 96), wait_bars=0,
                 opened=datetime.now(TR).isoformat(timespec="minutes"),
                 last_check=str(s["time"]),
@@ -192,6 +188,7 @@ def open_positions(sigs, max_open=MAX_OPEN, balance=None, risk_pct=RISK_PCT):
                 risk_usdt=risk_usdt,
                 r1=entry + (risk if d == "LONG" else -risk),
                 rr_raw=s["rr"], half=False, bars=0, score=s["score"],
+                no_partial=bool(s.get("no_partial")),
                 opened=datetime.now(TR).isoformat(timespec="minutes"),
                 last_check=str(s["time"]),
                 page_id=s.get("notion_page_id")))
