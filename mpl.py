@@ -1,13 +1,10 @@
-"""Maximum Pain Level (MPL) — v1.2.3
-SL KURALI (kullanıcı, v1.2.3 netleşti):
-  SL çapası = MSB'yi tetikleyen 15M hareketinin KÖKÜNÜN 1H karşılığı extreme.
-  Adımlar:
-    1) 15M'de son yükseliş bacağı bulunur (son derin dip → MSB tetik mumu)
-    2) Bacağın başlangıç dip fitili = "kök" (zaman damgasıyla)
-    3) 1H'da kök zamanına karşılık gelen bölgedeki en düşük fitil = SL anchor (SHORT)
-       Güvence: anchor ≥ 1H son swing high fitili olabilir (yapısal extreme korunur)
-    4) LONG ayna: son düşüş bacağının kökü → 1H en yüksek fitil
-v1.2: TP=2R sabit, kısmi TP kapalı | v1.1: IDM şartı | havuz: birbirini yememiş tepeler"""
+"""Maximum Pain Level (MPL) — v1.2.4
+v1.2.4 FIX: bacak kökü tanımı daraltıldı.
+  ESKİ (hatalı): MSB'den geriye pencere EN DERİN dibi alıyordu → risk patlıyor, TP ulaşılmaz
+  YENİ: MSB'den geriye İLK ONAYLI 15M swing low = yükseliş bacağının başladığı dip.
+        (Kullanıcı çizimindeki 'hareketin kökü' tam olarak bu dönüş noktası.)
+  Sonra kök zamanı 1H'a map'lenir (±1 mum penceresi min low) + yapısal extreme güvencesi.
+v1.2: TP=2R sabit, kısmi TP kapalı | v1.1: IDM şartı | havuz: birbirini yememiş tepe/dip"""
 import numpy as np
 import pandas as pd
 import smc
@@ -18,7 +15,7 @@ LTF_EXPIRY_BARS  = 96
 IDM_WINDOW       = 20
 IDM_PROMINENCE   = 1.0
 TP_R             = 2.0
-LEG_LOOKBACK     = 60     # 15M'de bacak başlangıcı aranacak pencere (15 mum = 15s)
+MAX_RISK_PCT     = 0.05   # güvenlik: risk, fiyatın %5'ini aşamaz (bozuk geometri koruması)
 
 def _find_idm_high(df, end_idx: int):
     start = max(0, end_idx - IDM_WINDOW)
@@ -99,37 +96,46 @@ def _pool_stats(df, swings, kind):
                               top=max(g[0] for g in group), bottom=min(g[0] for g in group)))
     return pools
 
-def _leg_root_time(ltf, msb_idx: int) -> pd.Timestamp:
-    """15M'de MSB tetikleyen YÜKSELİŞ bacağının başlangıç dip zamanı.
-    MSB mumundan geriye LEG_LOOKBACK mum içinde EN DERİN dip = bacak kökü."""
-    start = max(0, msb_idx - LEG_LOOKBACK)
-    window = ltf.iloc[start:msb_idx + 1]
-    lo_i = window["low"].idxmin()          # en derin dip (fitil)
+def _leg_root_time(ltf, msb_idx: int, ltf_swings) -> tuple:
+    """SHORT: MSB'den geriye İLK onaylı 15M swing low = yükselişin başladığı dip (kök)."""
+    for s in sorted(ltf_swings, key=lambda s: -s.idx):
+        if s.idx < msb_idx and s.kind == "L":
+            return ltf.loc[s.idx, "t"], float(ltf.loc[s.idx, "low"])
+    # swing yoksa (nadir): 10 mumluk mini pencere dibi
+    window = ltf.iloc[max(0, msb_idx - 10):msb_idx + 1]
+    lo_i = window["low"].idxmin()
     return ltf.loc[lo_i, "t"], float(ltf.loc[lo_i, "low"])
 
-def _sl_anchor_short_1h(htf, root_time: pd.Timestamp, htf_swings):
-    """SHORT: kök zamanına karşılık gelen 1H bölgesindeki en düşük fitil.
-    1H'da root_time'dan ÖNCEKİ + O ANDAKİ mumlar (bacağın 1H yansıması) taranır:
-    root_time'a en yakın 3×1H mum penceresindeki min low. Güvence: 1H son swing high
-    fitilinden küçük olamaz (yapısal extreme korunur)."""
+def _leg_root_time_long(ltf, msb_idx: int, ltf_swings) -> tuple:
+    """LONG: MSB'den geriye İLK onaylı 15M swing high = düşüşün başladığı tepe (kök)."""
+    for s in sorted(ltf_swings, key=lambda s: -s.idx):
+        if s.idx < msb_idx and s.kind == "H":
+            return ltf.loc[s.idx, "t"], float(ltf.loc[s.idx, "high"])
+    window = ltf.iloc[max(0, msb_idx - 10):msb_idx + 1]
+    hi_i = window["high"].idxmax()
+    return ltf.loc[hi_i, "t"], float(ltf.loc[hi_i, "high"])
+
+def _sl_anchor_short_1h(htf, root_time, htf_swings):
     hs = [s.price for s in htf_swings if s.kind == "H"]
     idx_near = int((htf["t"] - root_time).abs().idxmin())
     start = max(0, idx_near - 1)
     end = min(len(htf), idx_near + 2)
     root_low = float(htf["low"].iloc[start:end].min())
-    structural = hs[-1] if hs else root_low
-    return max(root_low, structural) if structural else root_low
+    structural = hs[-1] if hs else None
+    if structural:
+        return max(root_low, min(structural, root_low + (root_low * 0.02)))
+    return root_low
 
-def _sl_anchor_long_1h(htf, root_time: pd.Timestamp, htf_swings):
-    """LONG ayna: kök zamanındaki 1H en yüksek fitil. Güvence: 1H son swing low'dan
-    büyük olamaz."""
+def _sl_anchor_long_1h(htf, root_time, htf_swings):
     ls = [s.price for s in htf_swings if s.kind == "L"]
     idx_near = int((htf["t"] - root_time).abs().idxmin())
     start = max(0, idx_near - 1)
     end = min(len(htf), idx_near + 2)
     root_high = float(htf["high"].iloc[start:end].max())
-    structural = ls[-1] if ls else root_high
-    return min(root_high, structural) if structural else root_high
+    structural = ls[-1] if ls else None
+    if structural:
+        return min(root_high, max(structural, root_high - (root_high * 0.02)))
+    return root_high
 
 def signal(ctx):
     htf, ltf = ctx["htf"], ctx["ltf"]
@@ -175,12 +181,12 @@ def signal(ctx):
             score += 10
         if ctx["sweep"]["bear"]: score += 5
         score += 10
-        # v1.2.3: SL = bacak kökünün 1H karşılığı (kullanıcı kuralı)
-        root_time, root_low15 = _leg_root_time(ltf, msb_idx)
+        root_time, _ = _leg_root_time(ltf, msb_idx, ltf_swings)
         anchor = _sl_anchor_short_1h(htf, root_time, htf_swings)
         sl = anchor + max(ctx["atr"] * 0.25, ctx["price"] * 0.0015)
         risk = sl - mid
-        if risk <= 0:
+        # v1.2.4 güvenlik: risk fiyatın %5'ini aşamaz (geometri koruması)
+        if risk <= 0 or risk > ctx["price"] * MAX_RISK_PCT:
             return None
         tp = mid - TP_R * risk
         rr = TP_R
@@ -188,7 +194,7 @@ def signal(ctx):
                 "MSB: 1H HL altına 15M kapanış",
                 f"IDM alındı: ara tepe {idm:.6g} süpürüldü",
                 "Giriş: FVG %50 (CE) limit — 24s ömür",
-                f"SL: bacak kökü 1H extreme üstü {anchor:.6g}+ (kural)",
+                f"SL: bacak kökü (ilk swing low) 1H extreme {anchor:.6g}+",
                 f"TP: sabit {TP_R}R (kısmi TP kapalı)"]
         return dict(kind="MPL_PENDING", symbol=ctx["symbol"], strategy="Maximum Pain Level",
                     direction="SHORT", limit=mid, sl=sl, tp=tp, rr=round(rr, 2),
@@ -229,12 +235,11 @@ def signal(ctx):
             score += 10
         if ctx["sweep"]["bull"]: score += 5
         score += 10
-        # v1.2.3: SL = düşüş bacağının kökünün 1H karşılığı (ayna)
-        root_time, _ = _leg_root_time_long(ltf, msb_idx)
+        root_time, _ = _leg_root_time_long(ltf, msb_idx, ltf_swings)
         anchor = _sl_anchor_long_1h(htf, root_time, htf_swings)
         sl = anchor - max(ctx["atr"] * 0.25, ctx["price"] * 0.0015)
         risk = mid - sl
-        if risk <= 0:
+        if risk <= 0 or risk > ctx["price"] * MAX_RISK_PCT:
             return None
         tp = mid + TP_R * risk
         rr = TP_R
@@ -242,18 +247,10 @@ def signal(ctx):
                 "MSB: 1H LH üstüne 15M kapanış",
                 f"IDM alındı: ara dip {idm:.6g} süpürüldü",
                 "Giriş: FVG %50 (CE) limit — 24s ömür",
-                f"SL: bacak kökü 1H extreme altı {anchor:.6g}- (kural)",
+                f"SL: bacak kökü (ilk swing high) 1H extreme {anchor:.6g}-",
                 f"TP: sabit {TP_R}R (kısmi TP kapalı)"]
         return dict(kind="MPL_PENDING", symbol=ctx["symbol"], strategy="Maximum Pain Level",
                     direction="LONG", limit=mid, sl=sl, tp=tp, rr=round(rr, 2),
                     score=min(score, 100), expiry_bars=LTF_EXPIRY_BARS,
                     confluences=conf, time=ltf["t"].iloc[-1])
     return None
-
-def _leg_root_time_long(ltf, msb_idx: int) -> tuple:
-    """LONG ayna: MSB tetikleyen DÜŞÜŞ bacağının başlangıç tepe zamanı.
-    MSB'den geriye pencerede EN YÜKSEK fitil = kök."""
-    start = max(0, msb_idx - LEG_LOOKBACK)
-    window = ltf.iloc[start:msb_idx + 1]
-    hi_i = window["high"].idxmax()
-    return ltf.loc[hi_i, "t"], float(ltf.loc[hi_i, "high"])
