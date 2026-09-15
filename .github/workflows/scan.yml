@@ -9,6 +9,8 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      DATA_SOURCE: okx          # Bybit buluttan (ABD IP) bloklu → OKX kullan
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
