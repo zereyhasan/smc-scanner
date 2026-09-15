@@ -1,18 +1,19 @@
-"""Paper trade motoru v2 — BAKİYE TAKİPLİ PORTFÖY SİMÜLASYONU.
-Başlangıç bakiyesinden her sinyal %RISK ile pozisyon açar; SL/TP/BE simülasyonu
-bakiyeye işlenir. Equity geçmişi paper.json'da birikir → rapor istatistik + eğri çizer.
-State: paper.json | report.py'den çağrılır | tek başına: python paper_trade.py"""
+"""Paper trade motoru v2.1 — BAKİYE + PENDING (limit emir) desteği.
+MPL gibi 'pending=True' sinyalleri 'pending' listesinde bekler:
+  - fiyat limit'e dokunursa → pozisyona dönüşür (bars sayacı başlar)
+  - expiry_bars boyunca dokunmazsa → emir iptal
+Aynı coin+strateji+yön pending'de/açıktayken tekrar emir açılmaz."""
 import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import scanner
 
-FEE_RT   = 0.001          # işlem ücreti (notional, R'ye çevrilerek düşülür)
-MAX_BARS = 96             # 15m × 96 = 24 saat timeout
+FEE_RT   = 0.001
+MAX_BARS = 96
 MAX_OPEN = 6
-MAX_SAME_DIR = 3          # korelasyon limiti: aynı yönde en fazla 3 pozisyon
-RISK_PCT = 1.0            # işlem başına risk (% — bakiyeden)
-START_BALANCE = 1000.0    # simülasyon başlangıç bakiyesi
+MAX_SAME_DIR = 3
+RISK_PCT = 1.0
+START_BALANCE = 1000.0
 TR = timezone(timedelta(hours=3))
 STATE = Path("paper.json")
 
@@ -25,7 +26,8 @@ def _load():
     st.setdefault("start_balance", START_BALANCE)
     st.setdefault("open", [])
     st.setdefault("closed", [])
-    st.setdefault("equity", [])          # [(zaman, bakiye), ...]
+    st.setdefault("pending", [])
+    st.setdefault("equity", [])
     return st
 
 def _save(st):
@@ -44,17 +46,50 @@ def _notion_result(rec, balance_after):
     except Exception as e:
         print(f"  ⚠ Notion sonucu atlandı: {e!r}")
 
-def _equity_point(st, now=None):
-    ts = (now or datetime.now(TR)).strftime("%d.%m %H:%M")
-    st["equity"].append([ts, round(st["balance"], 2)])
-    # eğri hafif kalsın: son 300 nokta yeter
+def _equity_point(st):
+    st["equity"].append([datetime.now(TR).strftime("%d.%m %H:%M"), round(st["balance"], 2)])
     if len(st["equity"]) > 300:
         st["equity"] = st["equity"][-300:]
 
 def evaluate():
-    """Açık pozisyonları son kontrolden bu yana olan 15m mumlarla değerlendirir.
-    Kapanan işlemlerin PnL'i bakiyeye işlenir (compounding)."""
+    """1) Pending emirler: limit dokunuşu → pozisyon / expiry → iptal
+       2) Açık pozisyonlar: SL→BE→TP simülasyonu, kapanışlar bakiyeye işlenir."""
     st = _load()
+    # ---- pending emirler ----
+    still_pending = []
+    for o in st["pending"]:
+        try:
+            df = scanner.klines(o["symbol"], "15m", 200)
+            last = datetime.fromisoformat(o["last_check"])
+            candles = df[df["t"] > last]
+            filled = False
+            for _, bar in candles.iterrows():
+                o["wait_bars"] += 1
+                touched = (bar["high"] >= o["limit"] >= bar["low"])
+                if o["direction"] == "LONG":
+                    invalid = bar["high"] >= o["sl"]
+                else:
+                    invalid = bar["low"] <= o["sl"]
+                if touched:
+                    o["entry"] = o["limit"]          # limit fill
+                    st["open"].append(o)
+                    filled = True
+                    print(f"  ✎ Paper: {o['symbol']} MPL limit doldu → pozisyon")
+                    break
+                if invalid or o["wait_bars"] >= o["expiry_bars"]:
+                    filled = True                    # iptal (open'a girmeden biter)
+                    print(f"  ✎ Paper: {o['symbol']} MPL emri {(o['wait_bars']>=o['expiry_bars']) and 'süre doldu' or 'SL seviyesi görüldü — iptal'}")
+                    break
+            if not filled:
+                if len(candles):
+                    o["last_check"] = str(candles["t"].iloc[-1])
+                still_pending.append(o)
+        except Exception as e:
+            print(f"  ⚠ pending {o['symbol']}: {e!r}")
+            still_pending.append(o)
+    st["pending"] = still_pending
+
+    # ---- açık pozisyonlar (aynen v2) ----
     still = []
     for p in st["open"]:
         try:
@@ -72,17 +107,16 @@ def evaluate():
                     hit_sl = bar["high"] >= p["sl"]
                     hit_r1 = (not p["half"]) and bar["low"]  <= p["r1"]
                     hit_tp = bar["low"]  <= p["tp"]
-
-                if hit_sl:                                        # SL önce (muhafazakâr)
+                if hit_sl:
                     r = (0.5 if p["half"] else -1.0)
                     cp, cat = p["sl"], (bar["t"] + timedelta(hours=3)).strftime("%d.%m %H:%M")
-                elif hit_r1:                                      # %50 kâr @1R → SL girişe (BE)
+                elif hit_r1:
                     p["half"] = True
                     p["last_check"] = str(bar["t"]); continue
                 elif hit_tp:
                     r = (0.5 + 0.5 * p["rr_raw"]) if p["half"] else p["rr_raw"]
                     cp, cat = p["tp"], (bar["t"] + timedelta(hours=3)).strftime("%d.%m %H:%M")
-                elif p["bars"] >= MAX_BARS:                       # 24 saat → piyasadan kapat
+                elif p["bars"] >= MAX_BARS:
                     px = float(bar["close"])
                     raw = (px - p["entry"]) / p["risk"] if p["direction"] == "LONG" \
                           else (p["entry"] - px) / p["risk"]
@@ -90,10 +124,9 @@ def evaluate():
                     cp, cat = px, (bar["t"] + timedelta(hours=3)).strftime("%d.%m %H:%M") + " (24s)"
                 else:
                     p["last_check"] = str(bar["t"]); continue
-
                 fee = FEE_RT * p["entry"] / p["risk"]
                 net_r = r - fee
-                pnl = net_r * p["risk_usdt"]                      # 1R = risk_usdt
+                pnl = net_r * p["risk_usdt"]
                 st["balance"] = round(st["balance"] + pnl, 2)
                 rec = dict(p)
                 rec.update(result_r=round(net_r, 3), result_label=_label(net_r),
@@ -116,48 +149,57 @@ def evaluate():
     _save(st)
 
 def open_positions(sigs, max_open=MAX_OPEN, balance=None, risk_pct=RISK_PCT):
-    """Yeni sinyalleri sanal pozisyona çevirir:
-    - bakiye %risk ile risk_usdt hesaplanır (compounding)
-    - aynı coin+strateji+yön açıkken tekrar açılmaz
-    - aynı yönde en fazla MAX_SAME_DIR pozisyon (korelasyon limiti)
-    - toplam açık pozisyon ≤ max_open"""
+    """pending=True sinyaller → 'pending' listesine limit emir;
+    normal sinyaller → doğrudan pozisyon (v2 davranışı)."""
     st = _load()
     bal = balance if balance is not None else st["balance"]
     have = {(p["symbol"], p["strategy"], p["direction"]) for p in st["open"]}
+    have |= {(o["symbol"], o["strategy"], o["direction"]) for o in st["pending"]}
     dir_count = {"LONG": sum(1 for p in st["open"] if p["direction"] == "LONG"),
                  "SHORT": sum(1 for p in st["open"] if p["direction"] == "SHORT")}
-    opened = 0
+    opened, pend = 0, 0
     for s in sigs:
-        if len(st["open"]) >= max_open:
-            break
         d = "LONG" if s["direction"] == "LONG" else "SHORT"
-        if dir_count[d] >= MAX_SAME_DIR:
-            continue
         key = (s["symbol"], s["strategy"], d)
         if key in have:
             continue
-        risk = abs(s["entry"] - s["sl"])
+        is_pending = bool(s.get("pending"))
+        if not is_pending:
+            if len(st["open"]) >= max_open:
+                continue
+            if dir_count[d] >= MAX_SAME_DIR:
+                continue
+        risk = abs((s.get("limit", s["entry"])) - s["sl"])
         if risk <= 0:
             continue
-        risk_usdt = round(bal * risk_pct / 100, 2)
-        if risk_usdt < 1:                     # bakiye eridüyse min. 1$ risk altına inme
-            risk_usdt = 1.0
-        st["open"].append(dict(
-            symbol=s["symbol"], strategy=s["strategy"], direction=d,
-            entry=s["entry"], sl=s["sl"], tp=s["tp"], risk=risk,
-            risk_usdt=risk_usdt,
-            r1=s["entry"] + (risk if d == "LONG" else -risk),
-            rr_raw=s["rr"], half=False, bars=0, score=s["score"],
-            opened=datetime.now(TR).isoformat(timespec="minutes"),
-            last_check=str(s["time"]),
-            page_id=s.get("notion_page_id")))
-        have.add(key)
-        dir_count[d] += 1
-        opened += 1
+        risk_usdt = round(max(bal * risk_pct / 100, 1.0), 2)
+        if is_pending:
+            st["pending"].append(dict(
+                symbol=s["symbol"], strategy=s["strategy"], direction=d,
+                limit=s["entry"], sl=s["sl"], tp=s["tp"], risk=risk,
+                risk_usdt=risk_usdt,
+                rr_raw=s["rr"], score=s["score"],
+                expiry_bars=s.get("expiry_bars", 96), wait_bars=0,
+                opened=datetime.now(TR).isoformat(timespec="minutes"),
+                last_check=str(s["time"]),
+                page_id=s.get("notion_page_id")))
+            have.add(key); pend += 1
+        else:
+            entry = s["entry"]
+            st["open"].append(dict(
+                symbol=s["symbol"], strategy=s["strategy"], direction=d,
+                entry=entry, sl=s["sl"], tp=s["tp"], risk=risk,
+                risk_usdt=risk_usdt,
+                r1=entry + (risk if d == "LONG" else -risk),
+                rr_raw=s["rr"], half=False, bars=0, score=s["score"],
+                opened=datetime.now(TR).isoformat(timespec="minutes"),
+                last_check=str(s["time"]),
+                page_id=s.get("notion_page_id")))
+            have.add(key); dir_count[d] += 1; opened += 1
     _save(st)
-    if opened:
-        print(f"✅ Paper: {opened} yeni sanal pozisyon açıldı "
-              f"(açık {len(st['open'])}, bakiye {st['balance']:.2f}).")
+    if opened or pend:
+        print(f"✅ Paper: {opened} pozisyon, {pend} limit emir eklendi "
+              f"(açık {len(st['open'])}, bekleyen {len(st['pending'])}, bakiye {st['balance']:.2f}).")
     return opened
 
 def summary():
@@ -174,9 +216,10 @@ def summary():
     exp_r = round(sum(c["result_r"] for c in cl) / len(cl), 3) if cl else 0.0
     return dict(
         open=st["open"][-12:][::-1],
+        pending=st["pending"][-8:][::-1],
         closed=cl[-15:][::-1],
         equity=st["equity"][-120:],
-        n_open=len(st["open"]), n_closed=len(cl),
+        n_open=len(st["open"]), n_pending=len(st["pending"]), n_closed=len(cl),
         balance=bal, start_balance=st["start_balance"],
         pnl_total=pnl_total, pnl_pct=pnl_pct,
         wr=wr, pf=pf, exp_r=exp_r)
@@ -185,5 +228,5 @@ if __name__ == "__main__":
     evaluate()
     s = summary()
     print(f"Bakiye: {s['balance']:.2f} ({s['pnl_total']:+.2f} USDT, %{s['pnl_pct']:+.2f}) | "
-          f"Açık: {s['n_open']} | Kapanan: {s['n_closed']} | "
+          f"Açık: {s['n_open']} | Bekleyen: {s['n_pending']} | Kapanan: {s['n_closed']} | "
           f"WR: {s['wr'] if s['wr'] is not None else '—'}% | PF: {s['pf']}")

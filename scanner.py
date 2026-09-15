@@ -1,15 +1,14 @@
-"""100→50 coin SMC tarayıcı (v8.2): MCAP evreni + ÇİFT VERİ KAYNAĞI.
-DATA_SOURCE ortam değişkeni: 'bybit' (varsayılan, ev) | 'okx' (GitHub Actions bulutu —
-Bybit CloudFront ABD IP'lerini blokladığı için bulutta OKX kullanılır).
-Sembol gösterimi her kaynakta 'BTCUSDT' kalır → Notion/paper/rapor etkilenmez.
-v8.1 kalıtımları: _get_json (JSON-olmayan yanıtta açıklayıcı hata + retry),
-MCAP çift kaynak (CoinGecko → CoinPaprika → cache → turnover fallback)."""
+"""100→50 coin SMC tarayıcı (v8.3): çift veri kaynağı + ÇOKLU TEPE SÜPÜRME + MPL köprüsü.
+DATA_SOURCE: 'bybit' (varsayılan, ev) | 'okx' (bulut). Semboller 'BTCUSDT' gösteriminde kalır.
+v8.3: strategy_mpl köprüsü (Maximum Pain Level — mantık mpl.py'de, izole) + extra_sl."""
 import os, sys, json, time
 from pathlib import Path
 import requests
+import numpy as np
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import smc
+import mpl
 
 SOURCE = os.environ.get("DATA_SOURCE", "bybit").lower()   # 'bybit' | 'okx'
 
@@ -27,8 +26,8 @@ CAT_BANDS = ((10, "Majör"), (25, "Large"), (50, "Mid"))
 STOCKS = {"AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META",
           "COIN", "SPX", "NDX", "XAU"}
 
-MCAP_RANK = {}        # sembol -> (mcap_rank, kategori)
-_OKX_MAP = {}         # "BTCUSDT" -> "BTC-USDT-SWAP"
+MCAP_RANK = {}
+_OKX_MAP = {}
 _COLS = ["t", "open", "high", "low", "close", "volume"]
 
 STRAT_LABELS = {
@@ -36,13 +35,13 @@ STRAT_LABELS = {
     "strategy_fvg":      "FVG Retest",
     "strategy_sweep":    "Likidite Süpürme (Reversal)",
     "strategy_breaker":  "Breaker Block",
+    "strategy_multisweep": "Çoklu Tepe Süpürme (FVG)",
+    "strategy_mpl":      "Maximum Pain Level",
 }
 STRAT_BY_LABEL = {v: k for k, v in STRAT_LABELS.items()}
 
 # ---------------- Dayanıklı HTTP+JSON ----------------
 def _get_json(url, params=None, timeout=15, retries=2):
-    """GET → JSON. JSON-olmayan yanıtta status/content-type/ilk 200 karakterle hata verir.
-    429/5xx/ağ hatalarında artan beklemeyle yeniden dener."""
     last = None
     for attempt in range(retries + 1):
         try:
@@ -70,9 +69,8 @@ def _to_df(rows):
     df["t"] = pd.to_datetime(df["t"], unit="ms")
     return df
 
-# ---------------- OKX katmanı (bulut için) ----------------
+# ---------------- OKX katmanı (bulut) ----------------
 def _okx_symbol_map():
-    """OKX SWAP enstrümanları → 'BTCUSDT' gösterim haritası (bir kez çekilir)."""
     if _OKX_MAP:
         return _OKX_MAP
     tick = _get_json(f"{OKX}/api/v5/market/tickers", params={"instType": "SWAP"})
@@ -84,7 +82,6 @@ def _okx_symbol_map():
     return _OKX_MAP
 
 def _okx_klines(symbol, interval, limit):
-    """OKX mum verisi — 300'er sayfalı geriye doğru pagination."""
     m = _okx_symbol_map()
     inst = m.get(symbol)
     if not inst:
@@ -102,7 +99,7 @@ def _okx_klines(symbol, interval, limit):
             break
         rows.extend(batch)
         prev = after
-        after = batch[-1][0]          # batch yeniden eskiye → son eleman en eski
+        after = batch[-1][0]
         if len(batch) < 300:
             break
     if not rows:
@@ -110,7 +107,6 @@ def _okx_klines(symbol, interval, limit):
     return _to_df(rows)
 
 def _okx_universe_fallback(limit):
-    """MCAP yoksa: OKX tickers → yaklaşık USD hacim sıralı evren."""
     tick = _get_json(f"{OKX}/api/v5/market/tickers", params={"instType": "SWAP"})
     rows = []
     for it in tick.get("data", []):
@@ -136,20 +132,17 @@ def _category(rank: int) -> str:
     return "Mid"
 
 def _exchange_symbol_set() -> set:
-    """Aktif kaynağın borsa sembol kümesi ('BTCUSDT' gösterimi)."""
     if SOURCE == "okx":
         return set(_okx_symbol_map().keys())
     tick = _get_json(f"{FAPI}/v5/market/tickers", params=dict(category="linear"))
     return {x["symbol"] for x in tick["result"]["list"]}
 
 def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
-    """MCAP sıralaması: CoinGecko → CoinPaprika → mcap_cache.json → (boş=turnover fallback)"""
     global MCAP_RANK
     if MCAP_RANK and not force:
         return MCAP_RANK
     cache = Path("mcap_cache.json")
     data, src = None, None
-
     try:
         data = _get_json(f"{CG}/coins/markets",
                          params=dict(vs_currency="usd", order="market_cap_desc",
@@ -157,7 +150,6 @@ def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
         src = "coingecko"
     except Exception as e:
         print(f"  ⚠ CoinGecko başarısız: {e}", flush=True)
-
     if data is None:
         try:
             rows = _get_json(f"{PAPRIKA}/tickers")
@@ -166,7 +158,6 @@ def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
             src = "coinpaprika"
         except Exception as e:
             print(f"  ⚠ CoinPaprika da başarısız: {e}", flush=True)
-
     if data is None and cache.exists():
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
@@ -176,18 +167,15 @@ def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
     if not data:
         print("  ⚠ MCAP alınamadı — turnover fallback kullanılacak", flush=True)
         return MCAP_RANK
-
     try:
         cache.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
-
     try:
         exch = _exchange_symbol_set()
     except Exception as e:
         print(f"  ⚠ Borsa sembol listesi başarısız ({SOURCE}): {e}", flush=True)
         exch = set()
-
     rank = {}
     for c in data:
         sym = (c.get("symbol") or "").upper() + "USDT"
@@ -231,7 +219,6 @@ def klines(symbol, interval, limit=250):
     return df.sort_values("t").reset_index(drop=True)
 
 def klines_multi(symbol, interval, total=6000):
-    """Derin geçmiş. bybit: sayfalı çekim | okx: aynı pagination (derin backtest evde/bybit'te)."""
     if SOURCE == "okx":
         return _okx_klines(symbol, interval, total)
     pages, end = [], None
@@ -268,7 +255,8 @@ def build_context(symbol, htf, ltf):
     )
 
 # ---------------- Ortak Sinyal Tamamlayıcı ----------------
-def _finish(ctx, name, direction, zone_bottom, zone_top, extra_conf, require_conf=True):
+def _finish(ctx, name, direction, zone_bottom, zone_top, extra_conf,
+            require_conf=True, extra_sl=None):
     px, atr = ctx["price"], ctx["atr"]
     ok, cname = smc.confirmation(ctx["ltf"], direction)
     if require_conf and not ok:
@@ -293,6 +281,8 @@ def _finish(ctx, name, direction, zone_bottom, zone_top, extra_conf, require_con
     highs = [s.price for s in ctx["ltf_swings"] if s.kind == "H"][-3:]
     if direction == "LONG":
         sl = min([zone_bottom] + lows) - buf
+        if extra_sl is not None:
+            sl = min(sl, float(extra_sl) - buf)
         risk = px - sl
         if risk < min_stop:
             sl = px - min_stop
@@ -303,6 +293,8 @@ def _finish(ctx, name, direction, zone_bottom, zone_top, extra_conf, require_con
         tp = min(tp, px + RR_CAP * risk)
     else:
         sl = max([zone_top] + highs) + buf
+        if extra_sl is not None:
+            sl = max(sl, float(extra_sl) + buf)
         risk = sl - px
         if risk < min_stop:
             sl = px + min_stop
@@ -395,9 +387,84 @@ def strategy_breaker(ctx):
                                ["Bullish OB kırıldı → breaker direnç testi"])
     return None
 
-STRATS = [strategy_pullback, strategy_fvg, strategy_sweep, strategy_breaker]
+def strategy_multisweep(ctx):
+    """S5: ÇOKLU TEPE/DİP SÜPÜRME + FVG + CHoCH (kullanıcı tanımlı)"""
+    df, swings = ctx["ltf"], ctx["ltf_swings"]
+    n = len(df)
+    pools = smc.find_pools(df, swings)
+    o, h, l, c = (df[x].values for x in ("open", "high", "low", "close"))
+    body = np.abs(c - o)
+    avg = pd.Series(body).rolling(20).mean().values
+
+    for pool in pools["H"]:
+        swept_i, sweep_high = None, None
+        for j in range(max(0, n - 5), n):
+            strong = body[j] > 1.5 * max(avg[j - 1] if j > 0 else 0.0, 1e-12)
+            if h[j] > pool["top"] and c[j] < pool["top"] and strong:
+                swept_i, sweep_high = j, float(h[j]); break
+        if swept_i is None:
+            continue
+        ch_ok, _ = smc.choch(df, swings, direction="bear", since=swept_i)
+        if not ch_ok:
+            continue
+        for f in ctx["fvgs"]:
+            if (f["type"] == "bearish" and not f["filled"]
+                    and f["idx"] >= swept_i - 1
+                    and f["bottom"] <= ctx["price"] <= f["top"]):
+                sig = _finish(ctx, STRAT_LABELS["strategy_multisweep"], "SHORT",
+                              f["bottom"], f["top"],
+                              [f"Çoklu-tepe havuzu ({pool['touches']} tepe) tek mumla süpürüldü",
+                               "Süpürme displacement'ı FVG bıraktı — fiyat retest ediyor",
+                               "CHoCH: son HL kırıldı (dönüş onayı)"],
+                              require_conf=True, extra_sl=sweep_high)
+                if sig:
+                    return sig
+
+    for pool in pools["L"]:
+        swept_i, sweep_low = None, None
+        for j in range(max(0, n - 5), n):
+            strong = body[j] > 1.5 * max(avg[j - 1] if j > 0 else 0.0, 1e-12)
+            if l[j] < pool["bottom"] and c[j] > pool["bottom"] and strong:
+                swept_i, sweep_low = j, float(l[j]); break
+        if swept_i is None:
+            continue
+        ch_ok, _ = smc.choch(df, swings, direction="bull", since=swept_i)
+        if not ch_ok:
+            continue
+        for f in ctx["fvgs"]:
+            if (f["type"] == "bullish" and not f["filled"]
+                    and f["idx"] >= swept_i - 1
+                    and f["bottom"] <= ctx["price"] <= f["top"]):
+                sig = _finish(ctx, STRAT_LABELS["strategy_multisweep"], "LONG",
+                              f["bottom"], f["top"],
+                              [f"Çoklu-dip havuzu ({pool['touches']} dip) tek mumla süpürüldü",
+                               "Süpürme displacement'ı FVG bıraktı — fiyat retest ediyor",
+                               "CHoCH: son LH kırıldı (dönüş onayı)"],
+                              require_conf=True, extra_sl=sweep_low)
+                if sig:
+                    return sig
+    return None
+
+def strategy_mpl(ctx):
+    """S6: Maximum Pain Level — mpl.py izole modülünden PENDING sinyal üretir.
+    entry = FVG %50 limit fiyatı; paper/backtest bu sinyali limit emir olarak işler."""
+    try:
+        s = mpl.signal(ctx)
+    except Exception:
+        return None
+    if not s:
+        return None
+    return dict(symbol=ctx["symbol"], strategy=s["strategy"], direction=s["direction"],
+                entry=s["limit"], sl=s["sl"], tp=s["tp"], rr=s["rr"], score=s["score"],
+                confluences=s["confluences"], candle="Limit emir (CE %50)",
+                zone=(min(s["limit"], s["sl"]), max(s["limit"], s["sl"])),
+                time=ctx["ltf"]["t"].iloc[-1],
+                pending=True, expiry_bars=s["expiry_bars"])
+
+STRATS = [strategy_pullback, strategy_fvg, strategy_sweep,
+          strategy_breaker, strategy_multisweep, strategy_mpl]
 _BY_NAME = {f.__name__: f for f in STRATS}
-ACTIVE_STRATS = ["strategy_sweep", "strategy_breaker"]
+ACTIVE_STRATS = ["strategy_sweep", "strategy_breaker", "strategy_multisweep", "strategy_mpl"]
 
 # ---------------- Tarama ----------------
 def analyze(symbol):
@@ -413,7 +480,7 @@ def analyze(symbol):
                 sigs.append(s)
         return sigs or None
     except Exception as e:
-        print(f"  ⚠ {symbol}: {e!r}", flush=True)   # bulutta teşhis için sessiz yutma yok
+        print(f"  ⚠ {symbol}: {e!r}", flush=True)
         return None
 
 def scan(limit=MCAP_TOP, workers=8):
@@ -459,7 +526,7 @@ ZAMAN DİLİMİ : 15M (Giriş) / 1H (Trend)
 
 3️⃣ GİRİŞ
    Yön          : {arrow}
-   Giriş        : {sig['entry']:.6g}
+   Giriş        : {sig['entry']:.6g}{' (LIMIT)' if sig.get('pending') else ''}
    Giriş Mumu   : {sig['candle']}
 
 4️⃣ STOP LOSS
