@@ -1,7 +1,11 @@
-"""100→50 coin SMC tarayıcı (v8): Piyasa değeri (market cap) evreni + kategori haritası.
-Evren: CoinGecko MCAP ilk 50 → Bybit futures kesişimi. CoinGecko erişilemezse
-turnover fallback + mcap_cache.json. Grup analizi için: scanner.MCAP_RANK[sym]=(rank,kategori)"""
-import sys, json
+"""100→50 coin SMC tarayıcı (v8.1): MCAP evreni + buluta dayanıklı veri katmanı.
+v8.1 yenilikleri:
+- _get_json(): JSON-olmayan yanıt durumunda status+content-type+ilk 200 karakteri
+  açıklayan hatayı fırlatır (JSONDecodeError karanlığında teşhis artık logda)
+- 429/5xx/ağ hatalarında 2 yeniden deneme (artan bekleme)
+- MCAP için ÇİFT KAYNAK: CoinGecko → başarısızsa CoinPaprika → o da olursa cache →
+  en son turnover fallback (grup analizi MCAP_RANK'i kullanmaya devam eder)"""
+import sys, json, time
 from pathlib import Path
 import requests
 import pandas as pd
@@ -10,16 +14,17 @@ import smc
 
 FAPI = "https://api.bybit.com"
 CG   = "https://api.coingecko.com/api/v3"
+PAPRIKA = "https://api.coinpaprika.com/v1"
 _IV = {"15m": "15", "1h": "60", "4h": "240"}
 MIN_RR = 1.8
 RR_CAP = 2.5
-MCAP_TOP  = 50                                   # evren büyüklüğü (piyasa değeri sırası)
+MCAP_TOP  = 50
 CAT_BANDS = ((10, "Majör"), (25, "Large"), (50, "Mid"))
 
 STOCKS = {"AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META",
           "COIN", "SPX", "NDX", "XAU"}
 
-MCAP_RANK = {}   # sembol -> (mcap_rank, kategori)   [gruplu analiz bunu kullanır]
+MCAP_RANK = {}   # sembol -> (mcap_rank, kategori)
 
 STRAT_LABELS = {
     "strategy_pullback": "Trend Pullback (OB)",
@@ -29,6 +34,30 @@ STRAT_LABELS = {
 }
 STRAT_BY_LABEL = {v: k for k, v in STRAT_LABELS.items()}
 
+# ---------------- Dayanıklı HTTP+JSON ----------------
+def _get_json(url, params=None, timeout=15, retries=2):
+    """GET → JSON. JSON-olmayan yanıtta status/content-type/ilk 200 karakterle hata verir.
+    429/5xx/ağ hatalarında artan beklemeyle yeniden dener."""
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last = RuntimeError(f"HTTP {r.status_code}")
+            else:
+                try:
+                    return r.json()
+                except ValueError:
+                    raise RuntimeError(
+                        f"JSON-olmayan yanıt: HTTP {r.status_code} | "
+                        f"content-type={r.headers.get('content-type')} | "
+                        f"ilk 200 karakter: {r.text[:200]!r}")
+        except requests.RequestException as e:
+            last = e
+        if attempt < retries:
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"{url} başarısız ({retries + 1} deneme): {last}")
+
 # ---------------- Market Cap evreni ----------------
 def _category(rank: int) -> str:
     for cap, name in CAT_BANDS:
@@ -37,38 +66,56 @@ def _category(rank: int) -> str:
     return "Mid"
 
 def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
-    """CoinGecko MCAP sıralamasını çeker, Bybit futures sembolleriyle eşleştirir.
-    Sonuç MCAP_RANK'e yazılır; ağ hatasında mcap_cache.json'a düşer."""
+    """MCAP sıralaması: CoinGecko → CoinPaprika → mcap_cache.json → (boş=turnover fallback)"""
     global MCAP_RANK
     if MCAP_RANK and not force:
         return MCAP_RANK
     cache = Path("mcap_cache.json")
-    data = None
+    data, src = None, None
+
+    # 1) CoinGecko
     try:
-        r = requests.get(f"{CG}/coins/markets",
+        data = _get_json(f"{CG}/coins/markets",
                          params=dict(vs_currency="usd", order="market_cap_desc",
-                                     per_page=min(limit, 250), page=1),
-                         timeout=15)
-        if r.status_code == 200 and isinstance(r.json(), list):
-            data = r.json()
-            cache.write_text(json.dumps(data), encoding="utf-8")
-        else:
-            print(f"  ⚠ CoinGecko HTTP {r.status_code} — cache/fallback deneniyor", flush=True)
+                                     per_page=min(limit, 250), page=1))
+        src = "coingecko"
     except Exception as e:
-        print(f"  ⚠ CoinGecko erişilemedi ({e!r}) — cache/fallback", flush=True)
+        print(f"  ⚠ CoinGecko başarısız: {e}", flush=True)
+
+    # 2) CoinPaprika (anahtar gerekmez, Cloudflare dostu)
+    if data is None:
+        try:
+            rows = _get_json(f"{PAPRIKA}/tickers")
+            data = [dict(symbol=c.get("symbol"), market_cap_rank=c.get("rank"))
+                    for c in rows if (c.get("rank") or 999) <= limit + 50]
+            src = "coinpaprika"
+        except Exception as e:
+            print(f"  ⚠ CoinPaprika da başarısız: {e}", flush=True)
+
+    # 3) Cache
     if data is None and cache.exists():
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
+            src = "cache"
         except Exception:
             data = None
     if not data:
-        return MCAP_RANK                      # boş → çağıran turnover fallback'e düşer
+        print("  ⚠ MCAP alınamadı — turnover fallback kullanılacak", flush=True)
+        return MCAP_RANK
+
+    if cache.exists() or src in ("coingecko", "coinpaprika"):
+        try:
+            cache.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+
     try:
-        bybit = {x["symbol"] for x in requests.get(
-            f"{FAPI}/v5/market/tickers", params=dict(category="linear"),
-            timeout=15).json()["result"]["list"]}
-    except Exception:
+        tick = _get_json(f"{FAPI}/v5/market/tickers", params=dict(category="linear"))
+        bybit = {x["symbol"] for x in tick["result"]["list"]}
+    except Exception as e:
+        print(f"  ⚠ Bybit tickers başarısız: {e}", flush=True)
         bybit = set()
+
     rank = {}
     for c in data:
         sym = (c.get("symbol") or "").upper() + "USDT"
@@ -76,21 +123,20 @@ def ensure_mcap(limit: int = MCAP_TOP, force: bool = False) -> dict:
         if sym in bybit and sym not in rank and sym[:-4] not in STOCKS:
             rank[sym] = (rk, _category(rk))
     MCAP_RANK = rank
+    print(f"  MCAP kaynağı: {src} → {len(rank)} coin Bybit futures ile eşleşti", flush=True)
     return MCAP_RANK
 
 # ---------------- Veri (Bybit) ----------------
 def universe(limit=MCAP_TOP):
-    """Piyasa değeri sırasına göre evren. CoinGecko yoksa turnover fallback."""
     limit = min(limit, MCAP_TOP)
     ensure_mcap(limit)
     if len(MCAP_RANK) >= limit:
         return sorted(MCAP_RANK, key=lambda s: MCAP_RANK[s][0])[:limit]
-    if MCAP_RANK:                              # kısmi liste → yine mcap sırası
+    if MCAP_RANK:
         print(f"  ⚠ MCAP eşleşen coin {len(MCAP_RANK)} adet (< {limit}) — bunlar kullanılıyor")
         return sorted(MCAP_RANK, key=lambda s: MCAP_RANK[s][0])
     print("  ⚠ MCAP alınamadı — turnover fallback (24s hacim sıralı)")
-    t = requests.get(f"{FAPI}/v5/market/tickers",
-                     params=dict(category="linear"), timeout=15).json()
+    t = _get_json(f"{FAPI}/v5/market/tickers", params=dict(category="linear"))
     rows = [x for x in t["result"]["list"] if x["symbol"].endswith("USDT")
             and x["symbol"][:-4] not in STOCKS
             and not any(k in x["symbol"] for k in ("UP", "DOWN", "BULL", "BEAR"))]
@@ -99,10 +145,9 @@ def universe(limit=MCAP_TOP):
 
 def klines(symbol, interval, limit=250):
     limit = min(limit, 1000)
-    d = requests.get(f"{FAPI}/v5/market/kline",
-                     params=dict(category="linear", symbol=symbol,
-                                 interval=_IV.get(interval, interval), limit=limit),
-                     timeout=15).json()
+    d = _get_json(f"{FAPI}/v5/market/kline",
+                  params=dict(category="linear", symbol=symbol,
+                              interval=_IV.get(interval, interval), limit=limit))
     rows = [(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
             for k in d["result"]["list"]]
     df = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close", "volume"])
@@ -110,14 +155,13 @@ def klines(symbol, interval, limit=250):
     return df.sort_values("t").reset_index(drop=True)
 
 def klines_multi(symbol, interval, total=6000):
-    """Sayfa sayfa geriye giderek uzun geçmiş (derin backtest ~62 gün)."""
     pages, end = [], None
     while sum(len(p) for p in pages) < total:
         params = dict(category="linear", symbol=symbol,
                       interval=_IV.get(interval, interval), limit=1000)
         if end:
             params["end"] = end
-        d = requests.get(f"{FAPI}/v5/market/kline", params=params, timeout=15).json()
+        d = _get_json(f"{FAPI}/v5/market/kline", params=params)
         rows = d.get("result", {}).get("list", [])
         if not rows:
             break
@@ -279,7 +323,7 @@ def strategy_breaker(ctx):
 
 STRATS = [strategy_pullback, strategy_fvg, strategy_sweep, strategy_breaker]
 _BY_NAME = {f.__name__: f for f in STRATS}
-ACTIVE_STRATS = ["strategy_sweep", "strategy_breaker"]   # canlıda açık stratejiler
+ACTIVE_STRATS = ["strategy_sweep", "strategy_breaker"]
 
 # ---------------- Tarama ----------------
 def analyze(symbol):
@@ -294,7 +338,8 @@ def analyze(symbol):
             if s:
                 sigs.append(s)
         return sigs or None
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠ {symbol}: {e!r}", flush=True)   # sessiz yutma — bulutta teşhis için görünür
         return None
 
 def scan(limit=MCAP_TOP, workers=8):
